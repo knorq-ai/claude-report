@@ -1,0 +1,12 @@
+name = "claude-report-relay"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+
+[[kv_namespaces]]
+binding = "STORE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# ローカル開発用
+# [vars]
+# SLACK_CLIENT_ID = ""
+# SLACK_CLIENT_SECRET = ""

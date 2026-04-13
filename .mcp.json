@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "claude-report": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/mcp/server.js"],
+      "env": {
+        "CLAUDE_REPORT_SLACK_BOT_TOKEN": "${user_config.slack_bot_token}",
+        "CLAUDE_REPORT_SLACK_CHANNEL": "${user_config.slack_channel}",
+        "CLAUDE_REPORT_USER_NAME": "${user_config.display_name}",
+        "CLAUDE_REPORT_DATA_DIR": "${CLAUDE_PLUGIN_DATA}"
+      }
+    }
+  }
+}

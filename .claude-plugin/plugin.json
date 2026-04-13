@@ -1,0 +1,24 @@
+{
+  "name": "claude-report",
+  "version": "0.1.0",
+  "description": "Automatic dev status updates from Claude Code to Slack. Gives managers real-time visibility without interrupting developers.",
+  "author": {
+    "name": "Yuya Morita"
+  },
+  "license": "MIT",
+  "keywords": ["slack", "status", "team", "reporting", "mcp"],
+  "userConfig": {
+    "slack_bot_token": {
+      "description": "Slack Bot Token (xoxb-...). Create a Slack app with chat:write, channels:history, channels:read, users:read scopes.",
+      "sensitive": true
+    },
+    "slack_channel": {
+      "description": "Slack channel ID to post updates (e.g., C0AS7LC0X9B). Find it in channel details.",
+      "sensitive": false
+    },
+    "display_name": {
+      "description": "Your name as shown in Slack status posts (e.g., Yuya Morita)",
+      "sensitive": false
+    }
+  }
+}

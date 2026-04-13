@@ -1,0 +1,59 @@
+{
+  "name": "claude-report",
+  "version": "0.1.0",
+  "description": "Automatic dev status updates from Claude Code to Slack",
+  "type": "module",
+  "bin": {
+    "claude-report": "./dist/cli/index.js"
+  },
+  "main": "./dist/core/index.js",
+  "types": "./dist/core/index.d.ts",
+  "exports": {
+    ".": "./dist/core/index.js",
+    "./mcp": "./dist/mcp/server.js"
+  },
+  "files": [
+    "dist",
+    ".claude-plugin",
+    ".mcp.json",
+    "hooks",
+    "skills",
+    "claude-md-snippet.md",
+    "slack-app-manifest.json",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "claude --plugin-dir .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "claude-code",
+    "claude-code-plugin",
+    "mcp",
+    "slack",
+    "status",
+    "team",
+    "developer-tools"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@slack/web-api": "^7.9.1",
+    "commander": "^13.1.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1",
+    "@types/node": "^22.14.1"
+  }
+}

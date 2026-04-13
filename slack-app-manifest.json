@@ -1,0 +1,29 @@
+{
+  "display_information": {
+    "name": "Claude Report",
+    "description": "Automatic dev status updates from Claude Code",
+    "background_color": "#2251FF",
+    "long_description": "Claude Report integrates with Claude Code to automatically post developer status updates to Slack. Gives engineering managers real-time visibility into what the team is working on, without interrupting developers."
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Claude Report",
+      "always_online": true
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "chat:write",
+        "channels:history",
+        "channels:read",
+        "users:read"
+      ]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
