@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { post } from "./post.js";
 import { pause, resume } from "./pause.js";
 import { status } from "./status.js";
-import { register, unregister, list } from "./register.js";
+import { enable, disable, users } from "./register.js";
 
 // Hook and MCP entrypoints — checked before commander parses argv.
 const hookArg = process.argv[2];
@@ -25,19 +25,19 @@ program
   .version("0.1.0");
 
 program
-  .command("register [path]")
-  .description("Register a directory for status logging (default: current dir)")
-  .action(register);
+  .command("enable [user]")
+  .description("Enable reporting for a git user (default: current git user)")
+  .action(enable);
 
 program
-  .command("unregister [path]")
-  .description("Unregister a directory from status logging")
-  .action(unregister);
+  .command("disable [user]")
+  .description("Disable reporting for a git user")
+  .action(disable);
 
 program
-  .command("list")
-  .description("List all registered directories")
-  .action(list);
+  .command("users")
+  .description("List enabled users and current git identity")
+  .action(users);
 
 program
   .command("post <message>")

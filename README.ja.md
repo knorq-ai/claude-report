@@ -36,19 +36,21 @@ Claude Code が3つの値を聞いてくる:
 | **Slack Channel ID** | Slack チャンネル詳細画面の channel ID（例: `C0AS7LC0X9B`） |
 | **Display Name** | Slack 投稿に表示される名前 |
 
-### 3. プロジェクトの登録
+### 3. Git ユーザーの有効化
 
-登録されたディレクトリのみ更新を投稿する。追跡したいプロジェクトで以下を実行:
+デフォルトでは全員のレポートが有効。特定のチームメンバーに制限するには:
 
 ```bash
-cd ~/Projects/company-api
-claude-report register
-
-cd ~/Projects/mobile-app
-claude-report register
+claude-report enable             # 現在の git user を有効化（自動検出）
+claude-report enable ym259       # 名前で指定
+claude-report enable user@co.jp  # メールアドレスで指定
 ```
 
-これで完了。登録済みディレクトリで Claude Code を使うと、自動的にステータス更新が投稿される。
+1人以上のユーザーが有効化されると、有効なユーザーのみ更新を投稿する。GitHub、GitLab、Bitbucket など git を使うすべてのリポジトリで動作し、プロジェクトごとの設定は不要。
+
+```bash
+claude-report users              # 有効なユーザーと現在の git identity を確認
+```
 
 ## 仕組み
 
@@ -138,9 +140,9 @@ Claude Report  12:07 PM
 ## CLI
 
 ```bash
-claude-report register [path]     # ディレクトリをステータスログ対象に登録
-claude-report unregister [path]   # ディレクトリの登録を解除
-claude-report list                # 登録済みディレクトリを一覧表示
+claude-report enable [user]       # git user のレポートを有効化（デフォルト: 現在のユーザー）
+claude-report disable [user]      # git user のレポートを無効化
+claude-report users               # 有効なユーザーと現在の git identity を一覧表示
 claude-report post <message> -t <type>  # 手動でステータスを投稿
 claude-report pause               # 現在のプロジェクトの投稿をミュート
 claude-report resume              # ミュートを解除
@@ -169,7 +171,7 @@ plugin が有効な場合、Claude は以下の tool を使用できる:
 - **コンテンツフィルター**: シークレット（AWS key、JWT、Slack token、GitHub PAT）と絶対パスは投稿前に自動的にリダクトされる
 - **レート制限**: 投稿間隔は最低10分、セッションあたり10件、1日あたり30件。ブロッカーと完了報告はインターバル制限を bypass
 - **ミュート制御**: `claude-report pause`、`report_mute` MCP tool、`.claude-report.ignore` ファイル、`CLAUDE_REPORT_DISABLED=1` の4つの方法
-- **プロジェクト登録制**: 登録済みディレクトリのみ更新を投稿。未登録ディレクトリは沈黙
+- **ユーザーベースのアクセス制御**: git user 単位でレポートの有効/無効を切り替え。全リポジトリで動作
 - **認証情報の保管**: Slack bot token は system keychain に保存され、設定ファイルには含まれない
 
 ## 開発

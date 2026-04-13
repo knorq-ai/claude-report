@@ -1,5 +1,5 @@
-import { readCurrentSession, loadConfig, getConfigDir } from "../core/index.js";
-import { listRegisteredProjects } from "../core/registry.js";
+import { readCurrentSession, loadConfig } from "../core/index.js";
+import { listEnabledUsers, getGitUser, isUserEnabled } from "../core/registry.js";
 
 export async function status(): Promise<void> {
   console.log("\n  claude-report status\n");
@@ -16,18 +16,21 @@ export async function status(): Promise<void> {
     return;
   }
 
-  console.log(`  User: ${config.user.name || "(not set)"}`);
+  console.log(`  User: ${config.user.name || "(auto-detected)"}`);
   console.log(`  Mode: ${hasRelay ? "relay" : "direct"}`);
   console.log(`  Channel: ${config.slack.channel || "(from relay)"}`);
   console.log(`  Notifications: ${config.notifications.enabled ? "enabled" : "disabled"}`);
   console.log(`  Dry run: ${config.notifications.dryRun ? "yes" : "no"}`);
 
-  // Registered projects
-  const registered = listRegisteredProjects();
-  if (registered.length > 0) {
-    console.log(`  Registered projects: ${registered.length}`);
+  // User-based access control
+  const gitUser = getGitUser();
+  const enabled = listEnabledUsers();
+  const active = isUserEnabled();
+  if (enabled.length > 0) {
+    console.log(`  Git user: ${gitUser || "(not in a git repo)"} → ${active ? "enabled" : "disabled"}`);
+    console.log(`  Enabled users: ${enabled.join(", ")}`);
   } else {
-    console.log("  Registered projects: (all — run 'claude-report register' to restrict)");
+    console.log(`  Git user: ${gitUser || "(not in a git repo)"} → enabled (no restrictions)`);
   }
 
   // Session

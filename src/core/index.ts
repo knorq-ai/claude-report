@@ -40,15 +40,17 @@ export {
 export { getSecret, setSecret, deleteSecret } from "./keychain.js";
 export { atomicWriteJson } from "./fs-utils.js";
 export {
-  isProjectRegistered,
-  registerProject,
-  unregisterProject,
-  listRegisteredProjects,
+  isUserEnabled,
+  enableUser,
+  disableUser,
+  listEnabledUsers,
+  getGitUser,
+  getGitEmail,
 } from "./registry.js";
 
 import { loadConfig, isProjectDisabled } from "./config.js";
 import { getSecret } from "./keychain.js";
-import { isProjectRegistered } from "./registry.js";
+import { isUserEnabled } from "./registry.js";
 import {
   RelayPoster,
   DirectSlackPoster,
@@ -68,7 +70,7 @@ export function createPoster(
 ): StatusPoster | null {
   if (!config.notifications.enabled) return null;
   if (projectDir && isProjectDisabled(projectDir)) return null;
-  if (projectDir && !isProjectRegistered(projectDir)) return null;
+  if (!isUserEnabled(projectDir)) return null;
 
   if (config.notifications.dryRun) {
     return new DryRunPoster(config.user.name);

@@ -1,23 +1,25 @@
 import { existsSync, readFileSync, mkdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { join } from "node:path";
 import { getConfigDir } from "./config.js";
 import { atomicWriteJson } from "./fs-utils.js";
 
 interface Registry {
-  projects: string[]; // Absolute paths of registered directories
+  /** Git user names/emails that are enabled for reporting */
+  enabledUsers: string[];
 }
 
 function registryPath(): string {
-  return join(getConfigDir(), "registered.json");
+  return join(getConfigDir(), "registry.json");
 }
 
 function loadRegistry(): Registry {
   const file = registryPath();
-  if (!existsSync(file)) return { projects: [] };
+  if (!existsSync(file)) return { enabledUsers: [] };
   try {
     return JSON.parse(readFileSync(file, "utf-8"));
   } catch {
-    return { projects: [] };
+    return { enabledUsers: [] };
   }
 }
 
@@ -27,47 +29,79 @@ function saveRegistry(registry: Registry): void {
   atomicWriteJson(registryPath(), registry);
 }
 
+/** Get the git user name for the current directory */
+export function getGitUser(): string | null {
+  try {
+    return execFileSync("git", ["config", "user.name"], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Get the git user email for the current directory */
+export function getGitEmail(): string | null {
+  try {
+    return execFileSync("git", ["config", "user.email"], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Check if a directory (or any of its parents) is registered.
- * If no projects are registered at all, returns true (feature not active).
- * Once at least one project is registered, only registered directories emit logs.
+ * Check if reporting is enabled for the current git user.
+ * If no users are enabled, returns true (feature not active — report everywhere).
+ * Once at least one user is enabled, only enabled users emit logs.
+ * Matches against both git user.name and user.email.
  */
-export function isProjectRegistered(projectDir: string): boolean {
+export function isUserEnabled(projectDir?: string): boolean {
   const registry = loadRegistry();
-  if (registry.projects.length === 0) return true; // No registrations = post everywhere
-  const absDir = resolve(projectDir);
-  return registry.projects.some((registered) => {
-    const absRegistered = resolve(registered);
-    return absDir === absRegistered || absDir.startsWith(absRegistered + "/");
+  if (registry.enabledUsers.length === 0) return true;
+
+  const name = getGitUser();
+  const email = getGitEmail();
+
+  return registry.enabledUsers.some((entry) => {
+    const lower = entry.toLowerCase();
+    return (
+      (name && name.toLowerCase() === lower) ||
+      (email && email.toLowerCase() === lower)
+    );
   });
 }
 
-/** Register a directory for logging. */
-export function registerProject(projectDir: string): { added: boolean; path: string } {
-  const absDir = resolve(projectDir);
+/** Enable a git user for reporting. */
+export function enableUser(identifier: string): { added: boolean; user: string } {
   const registry = loadRegistry();
-  if (registry.projects.includes(absDir)) {
-    return { added: false, path: absDir };
+  const lower = identifier.toLowerCase();
+  const exists = registry.enabledUsers.some((u) => u.toLowerCase() === lower);
+  if (exists) {
+    return { added: false, user: identifier };
   }
-  registry.projects.push(absDir);
+  registry.enabledUsers.push(identifier);
   saveRegistry(registry);
-  return { added: true, path: absDir };
+  return { added: true, user: identifier };
 }
 
-/** Unregister a directory. */
-export function unregisterProject(projectDir: string): { removed: boolean; path: string } {
-  const absDir = resolve(projectDir);
+/** Disable a git user from reporting. */
+export function disableUser(identifier: string): { removed: boolean; user: string } {
   const registry = loadRegistry();
-  const idx = registry.projects.indexOf(absDir);
+  const lower = identifier.toLowerCase();
+  const idx = registry.enabledUsers.findIndex((u) => u.toLowerCase() === lower);
   if (idx === -1) {
-    return { removed: false, path: absDir };
+    return { removed: false, user: identifier };
   }
-  registry.projects.splice(idx, 1);
+  registry.enabledUsers.splice(idx, 1);
   saveRegistry(registry);
-  return { removed: true, path: absDir };
+  return { removed: true, user: identifier };
 }
 
-/** List all registered directories. */
-export function listRegisteredProjects(): string[] {
-  return loadRegistry().projects;
+/** List all enabled users. */
+export function listEnabledUsers(): string[] {
+  return loadRegistry().enabledUsers;
 }

@@ -36,19 +36,21 @@ Claude Code will prompt for three values:
 | **Slack Channel ID** | Channel ID from Slack channel details (e.g. `C0AS7LC0X9B`) |
 | **Display Name** | Your name as shown in Slack posts |
 
-### 3. Register Projects
+### 3. Enable Your Git User
 
-Only registered directories emit status updates. Navigate to each project you want tracked:
+By default, reporting is active for everyone. To restrict it to specific team members:
 
 ```bash
-cd ~/Projects/company-api
-claude-report register
-
-cd ~/Projects/mobile-app
-claude-report register
+claude-report enable             # Enable for your current git user (auto-detected)
+claude-report enable ym259       # Or specify by name
+claude-report enable user@co.jp  # Or by email
 ```
 
-That's it. Status updates will post automatically when you use Claude Code in registered directories.
+Once at least one user is enabled, only enabled users emit updates. This works across all repos (GitHub, GitLab, Bitbucket — anything with git) without per-project setup.
+
+```bash
+claude-report users              # See who's enabled and your current git identity
+```
 
 ## How It Works
 
@@ -138,9 +140,9 @@ Create a `.claude-report.ignore` file in the project root, or set `CLAUDE_REPORT
 ## CLI
 
 ```bash
-claude-report register [path]     # Register a directory for status logging
-claude-report unregister [path]   # Unregister a directory
-claude-report list                # List registered directories
+claude-report enable [user]       # Enable reporting for a git user (default: current)
+claude-report disable [user]      # Disable reporting for a git user
+claude-report users               # List enabled users and current git identity
 claude-report post <message> -t <type>  # Manually post an update
 claude-report pause               # Mute posting for current project
 claude-report resume              # Unmute posting
@@ -169,7 +171,7 @@ These tools are available to Claude when the plugin is active:
 - **Content filter**: Secrets (AWS keys, JWTs, Slack tokens, GitHub PATs) and absolute file paths are automatically redacted before posting
 - **Rate limiting**: 10-minute interval between posts, 10 per session, 30 per day. Blockers and completions bypass the interval limit
 - **Mute controls**: `claude-report pause`, `report_mute` MCP tool, `.claude-report.ignore` file, or `CLAUDE_REPORT_DISABLED=1`
-- **Project registration**: Only registered directories emit updates. Unregistered directories are silent
+- **User-based access control**: Enable/disable reporting per git user. Works across all repos
 - **Credential storage**: Slack bot token is stored in the system keychain, never in config files
 
 ## Development
