@@ -1,0 +1,21 @@
+{
+  "name": "claude-report-marketplace",
+  "description": "Local marketplace for claude-report plugin",
+  "owner": {
+    "name": "Yuya Morita"
+  },
+  "version": "1.0.0",
+  "plugins": [
+    {
+      "name": "claude-report",
+      "description": "Automatic dev status updates from Claude Code to Slack",
+      "version": "0.1.0",
+      "author": {
+        "name": "Yuya Morita"
+      },
+      "source": "./",
+      "category": "productivity",
+      "tags": ["slack", "reporting", "status"]
+    }
+  ]
+}

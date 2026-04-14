@@ -11,8 +11,10 @@ import {
   updateSessionForProject,
   readSessionForProject,
   resolveProjectName,
+  resolveUserId,
   RateLimiter,
   ContentFilter,
+  sendWelcomeIfNeeded,
 } from "../core/index.js";
 import type {
   StatusUpdate,
@@ -23,23 +25,43 @@ import type {
 } from "../core/index.js";
 
 // ---------------------------------------------------------------------------
-// 初期化
+// 初期化 — try-catch でラップし、起動失敗時もサーバーは立ち上げる
+// （ツール呼び出し時にエラーメッセージを返せるようにするため）
 // ---------------------------------------------------------------------------
 
-const projectDir = process.cwd();
-const config = loadConfig(projectDir);
-const poster: StatusPoster | null = createPoster(config, projectDir);
-const fetcher: ReplyFetcher | null = createFetcher(config);
-const rateLimiter = new RateLimiter(config.rateLimit);
-const contentFilter = new ContentFilter();
-const project = resolveProjectName(projectDir);
+let config: ReturnType<typeof loadConfig>;
+let poster: StatusPoster | null = null;
+let fetcher: ReplyFetcher | null = null;
+let rateLimiter: RateLimiter;
+let contentFilter: ContentFilter;
+let project: string;
+let userId: string;
+let projectDir: string;
+let initError: string | null = null;
 
-/**
- * 現在のセッションを取得する。
- * getOrCreateSession は同期関数なのでそのまま呼ぶ。
- */
+try {
+  projectDir = process.cwd();
+  config = loadConfig(projectDir);
+  poster = createPoster(config, projectDir);
+  fetcher = createFetcher(config);
+  rateLimiter = new RateLimiter(config.rateLimit);
+  contentFilter = new ContentFilter();
+  project = resolveProjectName(projectDir);
+  userId = resolveUserId(config);
+} catch (err) {
+  initError = `Initialization failed: ${err instanceof Error ? err.message : err}`;
+  process.stderr.write(`[claude-report] ${initError}\n`);
+  // Provide fallback values so tools can return the error message
+  projectDir = process.cwd();
+  config = loadConfig(); // defaults only
+  rateLimiter = new RateLimiter(config.rateLimit);
+  contentFilter = new ContentFilter();
+  project = "unknown";
+  userId = "unknown";
+}
+
 function currentSession(): Session {
-  return getOrCreateSession(config.user.slackUserId, project);
+  return getOrCreateSession(userId, project);
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +73,10 @@ async function postStatusUpdate(
   summary: string,
   details?: string,
 ): Promise<string> {
+  if (initError) {
+    return `claude-report is not configured: ${initError}`;
+  }
+
   // プロジェクト無効チェック
   if (isProjectDisabled(projectDir)) {
     return "Status reporting is disabled for this project.";
@@ -61,6 +87,8 @@ async function postStatusUpdate(
     return "Status reporting is not configured. Run `claude-report setup` to set up.";
   }
 
+  await sendWelcomeIfNeeded(config);
+
   const session = currentSession();
 
   // StatusUpdate を組み立てる
@@ -69,7 +97,7 @@ async function postStatusUpdate(
     summary,
     details,
     timestamp: new Date(),
-    userId: config.user.slackUserId,
+    userId: userId,
     sessionId: session.sessionId,
     project,
   };
@@ -95,7 +123,7 @@ async function postStatusUpdate(
     const dailyPostCount =
       session.dailyPostDate === today ? session.dailyPostCount + 1 : 1;
 
-    updateSessionForProject(config.user.slackUserId, project, {
+    updateSessionForProject(userId, project, {
       threadId: result.threadId,
       postCount: session.postCount + 1,
       dailyPostCount,
@@ -194,7 +222,7 @@ server.tool(
       };
     }
 
-    const session = readSessionForProject(config.user.slackUserId, project);
+    const session = readSessionForProject(userId, project);
     if (!session?.threadId) {
       return {
         content: [
@@ -215,10 +243,13 @@ server.tool(
         };
       }
 
+      const MAX_AUTHOR = 50;
+      const MAX_TEXT = 300;
+      const sanitize = (s: string) => s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
       const formatted = replies
         .map(
           (r) =>
-            `[${r.timestamp.toISOString()}] ${r.author}: ${r.text}`,
+            `[${r.timestamp.toISOString()}] ${sanitize(r.author).slice(0, MAX_AUTHOR)}: ${sanitize(r.text).slice(0, MAX_TEXT)}`,
         )
         .join("\n");
 
@@ -244,7 +275,7 @@ server.tool(
   "Pause status posting for this session.",
   async () => {
     const session = currentSession();
-    updateSessionForProject(config.user.slackUserId, project, { muted: true });
+    updateSessionForProject(userId, project, { muted: true });
     return {
       content: [
         {
@@ -263,7 +294,7 @@ server.tool(
   "Resume status posting for this session.",
   async () => {
     const session = currentSession();
-    updateSessionForProject(config.user.slackUserId, project, { muted: false });
+    updateSessionForProject(userId, project, { muted: false });
     return {
       content: [
         {

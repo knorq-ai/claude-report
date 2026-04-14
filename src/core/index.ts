@@ -10,7 +10,7 @@ export type {
   Store,
 } from "./types.js";
 
-export { loadConfig, getConfigDir, getStateDir, getLogDir, isProjectDisabled } from "./config.js";
+export { loadConfig, getConfigDir, getStateDir, getLogDir, isProjectDisabled, resolveUserId } from "./config.js";
 export type { Config, RateLimitConfig } from "./config.js";
 
 export {
@@ -35,10 +35,12 @@ export {
   formatSlackBlocks,
   formatDailyParent,
   formatPlainText,
+  escapeSlackMrkdwn,
 } from "./formatter.js";
 
 export { getSecret, setSecret, deleteSecret } from "./keychain.js";
-export { atomicWriteJson } from "./fs-utils.js";
+export { atomicWriteJson, withFileLock } from "./fs-utils.js";
+export { sendWelcomeIfNeeded } from "./welcome.js";
 export {
   isUserEnabled,
   enableUser,

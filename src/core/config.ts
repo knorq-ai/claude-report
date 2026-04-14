@@ -176,6 +176,11 @@ export function loadConfig(projectDir?: string): Config {
   return config;
 }
 
+/** Resolve userId from config with consistent fallback chain */
+export function resolveUserId(config: Config): string {
+  return config.user.slackUserId || config.user.name || "unknown";
+}
+
 /** Auto-detect user name from git config */
 function getGitUserName(): string {
   try {

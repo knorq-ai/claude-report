@@ -9,8 +9,14 @@
   "main": "./dist/core/index.js",
   "types": "./dist/core/index.d.ts",
   "exports": {
-    ".": "./dist/core/index.js",
-    "./mcp": "./dist/mcp/server.js"
+    ".": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp/server.d.ts",
+      "import": "./dist/mcp/server.js"
+    }
   },
   "files": [
     "dist",

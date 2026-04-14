@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { join, basename } from "node:path";
 import { getStateDir } from "./config.js";
 import type { Session } from "./types.js";
-import { atomicWriteJson } from "./fs-utils.js";
+import { atomicWriteJson, withFileLock } from "./fs-utils.js";
 
 const STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -74,45 +74,48 @@ export function getOrCreateSession(
   mkdirSync(stateDir, { recursive: true });
 
   const sessionFile = sessionFilePath(userId, project);
-  const now = new Date().toISOString();
-  const today = todayStr();
 
-  if (existsSync(sessionFile)) {
-    try {
-      const existing: Session = JSON.parse(
-        readFileSync(sessionFile, "utf-8"),
-      );
+  return withFileLock(sessionFile, () => {
+    const now = new Date().toISOString();
+    const today = todayStr();
 
-      // Reuse if not stale
-      const lastActive = new Date(existing.lastActiveAt).getTime();
-      if (Date.now() - lastActive < STALE_THRESHOLD_MS) {
-        // Reset daily count if new day
-        if (existing.dailyPostDate !== today) {
-          existing.dailyPostCount = 0;
-          existing.dailyPostDate = today;
-          existing.threadId = null; // New day = new thread
+    if (existsSync(sessionFile)) {
+      try {
+        const existing: Session = JSON.parse(
+          readFileSync(sessionFile, "utf-8"),
+        );
+
+        // Reuse if not stale
+        const lastActive = new Date(existing.lastActiveAt).getTime();
+        if (Date.now() - lastActive < STALE_THRESHOLD_MS) {
+          // Reset daily count if new day
+          if (existing.dailyPostDate !== today) {
+            existing.dailyPostCount = 0;
+            existing.dailyPostDate = today;
+            existing.threadId = null; // New day = new thread
+          }
+          existing.lastActiveAt = now;
+          atomicWriteJson(sessionFile, existing);
+          return existing;
         }
-        existing.lastActiveAt = now;
-        atomicWriteJson(sessionFile, existing);
-        return existing;
-      }
 
-      // Stale but same day — preserve threadId for daily threading
-      if (existing.dailyPostDate === today) {
-        const refreshed = createSession(userId, project);
-        refreshed.threadId = existing.threadId;
-        refreshed.dailyPostCount = existing.dailyPostCount;
-        atomicWriteJson(sessionFile, refreshed);
-        return refreshed;
+        // Stale but same day — preserve threadId for daily threading
+        if (existing.dailyPostDate === today) {
+          const refreshed = createSession(userId, project);
+          refreshed.threadId = existing.threadId;
+          refreshed.dailyPostCount = existing.dailyPostCount;
+          atomicWriteJson(sessionFile, refreshed);
+          return refreshed;
+        }
+      } catch {
+        // Corrupted — create new
       }
-    } catch {
-      // Corrupted — create new
     }
-  }
 
-  const session = createSession(userId, project);
-  atomicWriteJson(sessionFile, session);
-  return session;
+    const session = createSession(userId, project);
+    atomicWriteJson(sessionFile, session);
+    return session;
+  });
 }
 
 function createSession(userId: string, project: string): Session {
@@ -141,18 +144,20 @@ export function updateSessionForProject(
   const sessionFile = sessionFilePath(userId, project);
   if (!existsSync(sessionFile)) return null;
 
-  try {
-    const session: Session = JSON.parse(
-      readFileSync(sessionFile, "utf-8"),
-    );
-    Object.assign(session, updates, {
-      lastActiveAt: new Date().toISOString(),
-    });
-    atomicWriteJson(sessionFile, session);
-    return session;
-  } catch {
-    return null;
-  }
+  return withFileLock(sessionFile, () => {
+    try {
+      const session: Session = JSON.parse(
+        readFileSync(sessionFile, "utf-8"),
+      );
+      Object.assign(session, updates, {
+        lastActiveAt: new Date().toISOString(),
+      });
+      atomicWriteJson(sessionFile, session);
+      return session;
+    } catch {
+      return null;
+    }
+  });
 }
 
 /**

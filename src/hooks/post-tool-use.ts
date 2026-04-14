@@ -12,9 +12,12 @@ import {
   getOrCreateSession,
   updateSessionForProject,
   resolveProjectName,
+  resolveUserId,
   RateLimiter,
+  ContentFilter,
+  sendWelcomeIfNeeded,
 } from "../core/index.js";
-import type { StatusUpdate, UpdateType } from "../core/index.js";
+import type { StatusUpdate, UpdateType, UpdateMetadata } from "../core/index.js";
 
 // ---------------------------------------------------------------------------
 // Input types
@@ -23,21 +26,30 @@ import type { StatusUpdate, UpdateType } from "../core/index.js";
 interface HookInput {
   tool_name: string;
   tool_input: Record<string, any>;
-  tool_output: string;
+  tool_output?: string;
+  tool_response?: string;
+  /** Current working directory of the Claude Code session */
+  cwd?: string;
+  session_id?: string;
+}
+
+/** Get tool output from hook input — handles both field names */
+function getToolOutput(input: HookInput): string {
+  return input.tool_output || input.tool_response || "";
 }
 
 // ---------------------------------------------------------------------------
 // Event detection: returns a status update or null
 // ---------------------------------------------------------------------------
 
-interface DetectedEvent {
+export interface DetectedEvent {
   type: UpdateType;
   summary: string;
   details?: string;
-  metadata?: Record<string, string>;
+  metadata?: UpdateMetadata;
 }
 
-function detectBashEvent(command: string, output: string): DetectedEvent | null {
+export function detectBashEvent(command: string, output: string): DetectedEvent | null {
   // 1. Git push
   if (/\bgit\s+push\b/.test(command) && !/--dry-run/.test(command)) {
     if (/^To\s+/m.test(output)) {
@@ -81,16 +93,13 @@ function detectBashEvent(command: string, output: string): DetectedEvent | null 
     return null;
   }
 
-  // 4. Test failures — common test runners with non-zero exit
+  // 4. Test failures — require exit code as primary signal to avoid false positives
   if (isTestCommand(command)) {
-    // Check for failure indicators in output
-    const hasFail =
-      /FAIL|failed|failing|error|Error/i.test(output) &&
-      !/\b0 fail/i.test(output) &&
-      !/\ball (?:tests? )?passed/i.test(output);
-    // Also check exit code hint (Claude Code includes exit info in output)
-    const hasExitError = /Exit code [1-9]|exit code [1-9]|exited with/i.test(output);
-    if (hasFail || hasExitError) {
+    const hasExitError = /Exit code [1-9]|exit code [1-9]|exited with (?:code )?[1-9]/i.test(output);
+    const hasFailCount = /(\d+)\s+(?:failed|failing)/i.test(output);
+    // Only report if exit code indicates failure, or if there's an explicit failure count
+    // (avoids false positives from words like "error" in passing test output)
+    if (hasExitError || hasFailCount) {
       const failCount = output.match(/(\d+)\s+(?:failed|failing)/i);
       const summary = failCount
         ? `Tests failing: ${failCount[1]} failures`
@@ -105,15 +114,38 @@ function detectBashEvent(command: string, output: string): DetectedEvent | null 
   return null;
 }
 
-function detectTaskEvent(input: Record<string, any>): DetectedEvent | null {
+export function detectTaskEvent(input: Record<string, any>, output: string): DetectedEvent | null {
   // TaskUpdate with status "completed"
   if (input.status === "completed" && input.taskId) {
+    const parsed = parseTaskOutput(output);
+    const subject = input.subject || parsed.subject || `#${input.taskId}`;
     return {
       type: "completion",
-      summary: `Task completed: ${input.subject || `#${input.taskId}`}`,
+      summary: `Task completed: ${subject}`,
+      details: parsed.description,
     };
   }
   return null;
+}
+
+/** Extract task subject and description from tool_output text */
+export function parseTaskOutput(output: string): { subject?: string; description?: string } {
+  if (!output) return {};
+  // Try JSON parse first (structured output)
+  try {
+    const data = JSON.parse(output);
+    return {
+      subject: data.subject || undefined,
+      description: data.description || undefined,
+    };
+  } catch {
+    // Fall back to text parsing
+  }
+  const subject = output.match(/subject[:\s]+"([^"]+)"/i)?.[1]
+    || output.match(/subject[:\s]+(.+)/im)?.[1]?.trim();
+  const description = output.match(/description[:\s]+"([^"]+)"/i)?.[1]
+    || output.match(/description[:\s]+(.+)/im)?.[1]?.trim();
+  return { subject: subject || undefined, description: description || undefined };
 }
 
 // ---------------------------------------------------------------------------
@@ -155,19 +187,20 @@ async function main(): Promise<void> {
   const input: HookInput = JSON.parse(raw);
 
   // Detect event based on tool type
+  const output = getToolOutput(input);
   let event: DetectedEvent | null = null;
 
   if (input.tool_name === "Bash") {
     const command = input.tool_input?.command || "";
-    event = detectBashEvent(command, input.tool_output || "");
+    event = detectBashEvent(command, output);
   } else if (input.tool_name === "TaskUpdate") {
-    event = detectTaskEvent(input.tool_input);
+    event = detectTaskEvent(input.tool_input, output);
   }
 
   if (!event) return;
 
-  // Load config and check guards
-  const projectDir = process.cwd();
+  // Use cwd from hook input (tracks cd), fall back to process.cwd()
+  const projectDir = input.cwd || process.cwd();
   const config = loadConfig(projectDir);
 
   if (!config.notifications.enabled) return;
@@ -179,27 +212,33 @@ async function main(): Promise<void> {
   const poster = createPoster(config, projectDir);
   if (!poster) return;
 
+  await sendWelcomeIfNeeded(config);
+
   const project = resolveProjectName(projectDir);
-  const userId = config.user.slackUserId || config.user.name || "unknown";
+  const userId = resolveUserId(config);
   const session = getOrCreateSession(userId, project);
 
   const rateLimiter = new RateLimiter(config.rateLimit);
-  const update: StatusUpdate = {
+  const contentFilter = new ContentFilter();
+  let update: StatusUpdate = {
     type: event.type,
     summary: event.summary,
     details: event.details,
-    metadata: event.metadata as any,
+    metadata: event.metadata,
     timestamp: new Date(),
     userId,
     sessionId: session.sessionId,
     project,
   };
 
+  update = contentFilter.filter(update);
+
   const rateResult = rateLimiter.shouldPost(update, session);
   if (!rateResult.allowed) return;
 
   try {
     const result = await poster.postUpdate(update, session.threadId);
+    rateLimiter.recordPost(update);
 
     const today = new Date().toISOString().slice(0, 10);
     const dailyPostCount =
@@ -217,4 +256,6 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(() => {}).finally(() => process.exit(0));
+main().catch((err) => {
+  process.stderr.write(`[claude-report] hook error: ${err instanceof Error ? err.message : err}\n`);
+}).finally(() => process.exit(0));

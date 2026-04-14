@@ -1,4 +1,4 @@
-import { updateSession, readCurrentSession } from "../core/index.js";
+import { readCurrentSession, updateSessionForProject } from "../core/index.js";
 
 export async function pause(): Promise<void> {
   const session = readCurrentSession();
@@ -7,8 +7,8 @@ export async function pause(): Promise<void> {
     return;
   }
 
-  updateSession({ muted: true });
-  console.log("  Status posting paused for this session.");
+  updateSessionForProject(session.userId, session.project, { muted: true });
+  console.log(`  Status posting paused for ${session.project}.`);
 }
 
 export async function resume(): Promise<void> {
@@ -18,6 +18,6 @@ export async function resume(): Promise<void> {
     return;
   }
 
-  updateSession({ muted: false });
-  console.log("  Status posting resumed.");
+  updateSessionForProject(session.userId, session.project, { muted: false });
+  console.log(`  Status posting resumed for ${session.project}.`);
 }

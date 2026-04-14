@@ -1,8 +1,15 @@
 import type { StatusUpdate } from "./types.js";
 
 /** Escape Slack mrkdwn special characters to prevent injection */
-function escapeSlackMrkdwn(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+export function escapeSlackMrkdwn(text: string): string {
+  // HTML entities (required by Slack mrkdwn)
+  let escaped = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  // Neutralize mrkdwn formatting by inserting zero-width space before trigger chars
+  escaped = escaped.replace(/([*_~`])/g, "\u200B$1");
+  return escaped;
 }
 
 const TYPE_INDICATORS: Record<string, string> = {
@@ -52,7 +59,9 @@ export function formatSlackBlocks(
   // Context line with metadata
   const contextElements: string[] = [];
   if (update.metadata?.branch) {
-    contextElements.push(`\u{1f33f} \`${escapeSlackMrkdwn(update.metadata.branch)}\``);
+    // Inside code span: mrkdwn is already neutralized, just strip backticks to prevent breakout
+    const safeBranch = update.metadata.branch.replace(/`/g, "'");
+    contextElements.push(`\u{1f33f} \`${safeBranch}\``);
   }
   if (update.metadata?.filesChanged !== undefined) {
     contextElements.push(
