@@ -41,6 +41,8 @@ export {
 export { getSecret, setSecret, deleteSecret } from "./keychain.js";
 export { atomicWriteJson, withFileLock } from "./fs-utils.js";
 export { sendWelcomeIfNeeded } from "./welcome.js";
+export { getDailyUsage, formatUsageSlackBlocks, getProjectSnippets } from "./usage-stats.js";
+export type { DailyUsage, SessionUsage } from "./usage-stats.js";
 export {
   isUserEnabled,
   enableUser,

@@ -20,5 +20,11 @@ You have MCP tools for posting status updates to the team Slack channel. Follow 
 - Call `fetch_feedback` at the start of a new task to check for manager comments.
 - If feedback is returned, acknowledge it and adjust your work accordingly.
 
+### Usage tracking
+- Call `report_usage` to post a daily token usage summary to Slack.
+- Pass a `date` parameter (YYYY-MM-DD) to report a specific day. Defaults to today.
+- To schedule automatic daily posting at 19:00 JST, the user runs once:
+  `/schedule create --cron "0 10 * * *" --prompt "call report_usage for yesterday's date"`
+
 ### If status tools are unavailable
 - Continue working normally. Status posting is supplementary — never let tool errors block your work.

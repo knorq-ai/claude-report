@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { WebClient } from "@slack/web-api";
 import { z } from "zod";
 
 import {
@@ -15,6 +16,10 @@ import {
   RateLimiter,
   ContentFilter,
   sendWelcomeIfNeeded,
+  getDailyUsage,
+  formatUsageSlackBlocks,
+  getProjectSnippets,
+  escapeSlackMrkdwn,
 } from "../core/index.js";
 import type {
   StatusUpdate,
@@ -303,6 +308,135 @@ server.tool(
         },
       ],
     };
+  },
+);
+
+// ---- report_usage -----------------------------------------------------------
+
+server.tool(
+  "report_usage",
+  "Get daily token usage stats and per-project activity snippets. After calling this, write a concise 1-line Japanese summary per project describing what was done (だ・である調), then call post_usage_to_slack with the summaries.",
+  {
+    date: z.string().optional().describe("Date to report (YYYY-MM-DD). Defaults to today."),
+  },
+  async ({ date }) => {
+    const targetDate = date || new Date().toISOString().slice(0, 10);
+    const usage = getDailyUsage(targetDate);
+
+    if (usage.totals.sessionCount === 0) {
+      return {
+        content: [{ type: "text", text: `No usage data found for ${targetDate}.` }],
+      };
+    }
+
+    const { totals, estimatedCostUsd } = usage;
+    const snippets = getProjectSnippets(usage);
+
+    const statsText = [
+      `Usage for ${targetDate}:`,
+      `Sessions: ${totals.sessionCount}, Prompts: ${totals.userMessages}, Claude turns: ${totals.assistantTurns}`,
+      `Input: ${formatTokenCount(totals.inputTokens)}, Output: ${formatTokenCount(totals.outputTokens)}`,
+      `Estimated cost: $${estimatedCostUsd.toFixed(2)}`,
+      "",
+      "Per-project activity (use this to write summaries):",
+      snippets,
+      "",
+      "NEXT STEP: Write a concise 1-line JAPANESE summary (だ・である調) per project describing what was accomplished.",
+      'Then call post_usage_to_slack with: date and summaries as a JSON object like {"Projects/claude-report": "セキュリティ強化とマーケットプレイス対応を実施", "firstlooptechnology/davie": "コードレビューとバグ修正"}',
+      "The tool will handle all formatting (stats, bullets, code spans). You only provide the summary text per project.",
+    ].join("\n");
+
+    return {
+      content: [{ type: "text", text: statsText }],
+    };
+  },
+);
+
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+// ---- post_usage_to_slack ----------------------------------------------------
+
+server.tool(
+  "post_usage_to_slack",
+  "Post the final usage summary with per-project descriptions to Slack. Call report_usage first to get the data. Pass summaries as JSON object mapping project path to Japanese summary string.",
+  {
+    date: z.string().describe("Date being reported (YYYY-MM-DD)"),
+    summaries: z.record(z.string(), z.string()).describe('JSON object: {"project/path": "日本語の要約", ...}. Keys must match project names from report_usage output.'),
+  },
+  async ({ date, summaries }) => {
+    if (!config.slack.botToken || !config.slack.channel) {
+      return { content: [{ type: "text", text: "Slack not configured." }] };
+    }
+
+    const usage = getDailyUsage(date);
+    const userName = config.user.name || "Unknown";
+    const safeName = escapeSlackMrkdwn(userName);
+    const { totals, estimatedCostUsd, sessions } = usage;
+
+    // Build per-project stats map
+    const byProject = new Map<string, { tokens: number; prompts: number }>();
+    for (const s of sessions) {
+      const existing = byProject.get(s.project) || { tokens: 0, prompts: 0 };
+      existing.tokens += s.inputTokens + s.outputTokens;
+      existing.prompts += s.userMessages;
+      byProject.set(s.project, existing);
+    }
+
+    // Build consolidated project lines with stats + summaries
+    const projectLines = [...byProject.entries()]
+      .sort((a, b) => b[1].tokens - a[1].tokens)
+      .map(([p, v]) => {
+        const summary = summaries[p] || "";
+        return `\u{2022} \`${p}\` — ${v.prompts} prompts, ${formatTokenCount(v.tokens)} tokens\n  ${escapeSlackMrkdwn(summary)}`;
+      })
+      .join("\n");
+
+    const blocks: object[] = [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `\u{1f4ca} *${safeName}* — Usage Summary (${date})`,
+        },
+      },
+      {
+        type: "section",
+        fields: [
+          { type: "mrkdwn", text: `*Sessions:* ${totals.sessionCount}` },
+          { type: "mrkdwn", text: `*Prompts:* ${totals.userMessages}` },
+          { type: "mrkdwn", text: `*Claude turns:* ${totals.assistantTurns}` },
+          { type: "mrkdwn", text: `*Input:* ${formatTokenCount(totals.inputTokens)}` },
+          { type: "mrkdwn", text: `*Output:* ${formatTokenCount(totals.outputTokens)}` },
+          { type: "mrkdwn", text: `*Est. cost:* $${estimatedCostUsd.toFixed(2)}` },
+        ],
+      },
+      { type: "divider" },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `*Projects:*\n${projectLines}`,
+        },
+      },
+    ];
+
+    const text = `\u{1f4ca} ${safeName} — Usage ${date}`;
+
+    try {
+      const client = new WebClient(config.slack.botToken, { timeout: 5000 });
+      await client.chat.postMessage({
+        channel: config.slack.channel,
+        text,
+        blocks: blocks as any,
+      });
+      return { content: [{ type: "text", text: `Usage summary for ${date} posted to Slack.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : err}` }] };
+    }
   },
 );
 
