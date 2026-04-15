@@ -9,8 +9,8 @@ Set up a scheduled task to post daily token usage summaries to Slack at 19:00 JS
 ## Instructions
 
 1. Use the CronCreate tool with these parameters:
-   - `cron`: `"3 10 * * *"` (10:03 UTC = 19:03 JST, offset to avoid burst)
-   - `prompt`: `"Call the report_usage MCP tool with yesterday's date to post token usage summary to Slack."`
+   - `cron`: `"0 19 * * *"` (19:00 local time — end of day report)
+   - `prompt`: `"Call the report_usage MCP tool for today's date (end-of-day report). Write Japanese summaries per project, then call post_usage_to_slack."`
    - `recurring`: `true`
 2. Confirm to the user that the schedule was created.
 3. Inform the user of these limitations:

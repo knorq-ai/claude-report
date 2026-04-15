@@ -8,16 +8,20 @@
 import {
   loadConfig,
   isProjectDisabled,
-  createPoster,
   getOrCreateSession,
   updateSessionForProject,
   resolveProjectName,
   resolveUserId,
-  RateLimiter,
   ContentFilter,
   sendWelcomeIfNeeded,
 } from "../core/index.js";
-import type { StatusUpdate, UpdateType, UpdateMetadata } from "../core/index.js";
+import type { UpdateType, UpdateMetadata } from "../core/index.js";
+
+/** Format today's date in local timezone as YYYY-MM-DD */
+function localDateStr(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
 
 // ---------------------------------------------------------------------------
 // Input types
@@ -205,54 +209,86 @@ async function main(): Promise<void> {
 
   if (!config.notifications.enabled) return;
   if (isProjectDisabled(projectDir)) return;
-
-  // Skip git push if onGitPush is false
-  if (event.type === "push" && !config.notifications.onGitPush) return;
-
-  const poster = createPoster(config, projectDir);
-  if (!poster) return;
+  if (!config.slack.botToken || !config.slack.channel) return;
 
   await sendWelcomeIfNeeded(config);
 
   const project = resolveProjectName(projectDir);
   const userId = resolveUserId(config);
-  const session = getOrCreateSession(userId, project);
+  const userName = config.user.name || "Unknown";
 
-  const rateLimiter = new RateLimiter(config.rateLimit);
+  // Single daily thread per user (not per project)
+  const session = getOrCreateSession(userId, "activity-log");
+
   const contentFilter = new ContentFilter();
-  let update: StatusUpdate = {
+
+  // Build compact log line: icon + project + summary
+  const ICONS: Record<string, string> = {
+    push: "\u{1f680}",       // rocket
+    status: "\u{1f4dd}",     // memo
+    completion: "\u{2705}",  // check
+    blocker: "\u{1f6d1}",    // stop
+    pivot: "\u{1f504}",      // arrows
+  };
+  const icon = ICONS[event.type] || "\u{1f535}";
+  let logText = `\`${project}\` ${icon} ${event.summary}`;
+  if (event.details) {
+    logText += `\n  ${event.details}`;
+  }
+
+  // Sanitize
+  const sanitized = contentFilter.filter({
     type: event.type,
-    summary: event.summary,
-    details: event.details,
-    metadata: event.metadata,
+    summary: logText,
     timestamp: new Date(),
     userId,
     sessionId: session.sessionId,
     project,
-  };
-
-  update = contentFilter.filter(update);
-
-  const rateResult = rateLimiter.shouldPost(update, session);
-  if (!rateResult.allowed) return;
+  });
+  logText = sanitized.summary;
 
   try {
-    const result = await poster.postUpdate(update, session.threadId);
-    rateLimiter.recordPost(update);
+    const { WebClient } = await import("@slack/web-api");
+    const client = new WebClient(config.slack.botToken, { timeout: 5000 });
 
-    const today = new Date().toISOString().slice(0, 10);
-    const dailyPostCount =
-      session.dailyPostDate === today ? session.dailyPostCount + 1 : 1;
+    // Create daily parent if no threadId yet
+    if (!session.threadId) {
+      const today = localDateStr();
+      const parent = await client.chat.postMessage({
+        channel: config.slack.channel,
+        text: `\u{1f4cb} ${userName} — ${today}`,
+        blocks: [{
+          type: "section",
+          text: { type: "mrkdwn", text: `\u{1f4cb} *${userName}* — Activity Log (${today})` },
+        }] as any,
+      });
+      if (parent.ts) {
+        updateSessionForProject(userId, "activity-log", {
+          threadId: parent.ts,
+          lastPostAt: new Date().toISOString(),
+          postCount: 1,
+          dailyPostCount: 1,
+          dailyPostDate: today,
+        });
+        session.threadId = parent.ts;
+      }
+    }
 
-    updateSessionForProject(userId, project, {
-      threadId: result.threadId,
-      lastPostAt: new Date().toISOString(),
-      postCount: session.postCount + 1,
-      dailyPostCount,
-      dailyPostDate: today,
-    });
+    // Post log entry as thread reply
+    if (session.threadId) {
+      await client.chat.postMessage({
+        channel: config.slack.channel,
+        thread_ts: session.threadId,
+        text: logText,
+      });
+
+      updateSessionForProject(userId, "activity-log", {
+        lastPostAt: new Date().toISOString(),
+        postCount: session.postCount + 1,
+      });
+    }
   } catch (err) {
-    console.error(`[claude-report] post failed: ${err instanceof Error ? err.message : err}`);
+    console.error(`[claude-report] log failed: ${err instanceof Error ? err.message : err}`);
   }
 }
 

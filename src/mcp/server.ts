@@ -320,7 +320,9 @@ server.tool(
     date: z.string().optional().describe("Date to report (YYYY-MM-DD). Defaults to today."),
   },
   async ({ date }) => {
-    const targetDate = date || new Date().toISOString().slice(0, 10);
+    // Default to today in local timezone (not UTC)
+    const now = new Date();
+    const targetDate = date || `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
     const usage = getDailyUsage(targetDate);
 
     if (usage.totals.sessionCount === 0) {

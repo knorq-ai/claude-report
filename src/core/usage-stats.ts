@@ -93,7 +93,7 @@ export function getDailyUsage(date: string): DailyUsage {
       const filePath = join(dirPath, file);
       try {
         const stat = statSync(filePath);
-        const fileDate = stat.mtime.toISOString().slice(0, 10);
+        const fileDate = localDateString(stat.mtime);
 
         // Only process files modified on the target date (or within 1 day for spanning sessions)
         if (fileDate < date && fileDate < prevDate(date)) continue;
@@ -171,9 +171,9 @@ function parseTranscript(filePath: string, date: string, project: string): Sessi
       entry = JSON.parse(line);
     } catch { continue; }
 
-    // Filter by date using the entry timestamp
+    // Filter by date using the entry timestamp (local timezone, not UTC)
     const ts = entry.timestamp;
-    const entryDate = ts ? new Date(ts).toISOString().slice(0, 10) : null;
+    const entryDate = ts ? localDateString(new Date(ts)) : null;
     const timeStr = ts ? new Date(ts).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }) : "";
 
     // Count real user prompts (exclude tool_result messages which the API sends as role:user)
@@ -328,6 +328,14 @@ function extractCwdFromTranscript(filePath: string): string | null {
     }
   } catch { /* ignore */ }
   return null;
+}
+
+/** Format a Date as YYYY-MM-DD in the local timezone */
+function localDateString(d: Date): string {
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 /** Derive a readable project name from an absolute path */
