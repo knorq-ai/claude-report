@@ -46,6 +46,11 @@
     "team",
     "developer-tools"
   ],
+  "author": "Yuya Morita",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/knorq-ai/claude-report.git"
+  },
   "license": "MIT",
   "engines": {
     "node": ">=20"
