@@ -5,7 +5,6 @@
  * Detects: git push, git commit, gh pr create, test failures, task completion.
  */
 
-import { WebClient } from "@slack/web-api";
 import {
   loadConfig,
   isProjectDisabled,
@@ -17,6 +16,20 @@ import {
   sendWelcomeIfNeeded,
 } from "../core/index.js";
 import type { UpdateType, UpdateMetadata } from "../core/index.js";
+
+/** Post to Slack using raw fetch — no external dependencies needed */
+async function slackPost(token: string, body: Record<string, unknown>): Promise<{ ok: boolean; ts?: string }> {
+  const res = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
+  });
+  return res.json() as Promise<{ ok: boolean; ts?: string }>;
+}
 
 /** Format today's date in local timezone as YYYY-MM-DD */
 function localDateStr(): string {
@@ -249,18 +262,16 @@ async function main(): Promise<void> {
   logText = sanitized.summary;
 
   try {
-    const client = new WebClient(config.slack.botToken, { timeout: 5000 });
-
     // Create daily parent if no threadId yet
     if (!session.threadId) {
       const today = localDateStr();
-      const parent = await client.chat.postMessage({
+      const parent = await slackPost(config.slack.botToken, {
         channel: config.slack.channel,
         text: `\u{1f4cb} ${userName} — ${today}`,
         blocks: [{
           type: "section",
           text: { type: "mrkdwn", text: `\u{1f4cb} *${userName}* — Activity Log (${today})` },
-        }] as any,
+        }],
       });
       if (parent.ts) {
         updateSessionForProject(userId, "activity-log", {
@@ -276,7 +287,7 @@ async function main(): Promise<void> {
 
     // Post log entry as thread reply
     if (session.threadId) {
-      await client.chat.postMessage({
+      await slackPost(config.slack.botToken, {
         channel: config.slack.channel,
         thread_ts: session.threadId,
         text: logText,
