@@ -2,13 +2,16 @@
 
 # claude-report
 
-A Claude Code plugin that automatically posts dev status updates to Slack. Gives engineering managers real-time visibility into what the team is working on, without interrupting developers.
+A Claude Code plugin that gives engineering managers real-time visibility into developer activity through Slack — without interrupting developers.
 
 ## Overview
 
-When team members use Claude Code for development, claude-report detects key events (git push, commits, PR creation, test failures, task completion) and posts structured updates to a shared Slack channel. Each developer gets a daily thread per project, keeping the channel scannable. Managers can reply on threads, and the feedback is automatically surfaced in the developer's next Claude Code session.
+claude-report integrates with Claude Code to provide two layers of visibility:
 
-The plugin combines three mechanisms: deterministic hooks for reliable event detection, MCP tools for richer LLM-driven updates, and a `/report` slash command for manual posting.
+1. **Real-time activity log** — hooks automatically detect git commits, pushes, PR creation, test failures, and task completions, posting compact log entries to a daily Slack thread
+2. **End-of-day summary** — parses Claude Code transcript files to generate per-project usage stats and AI-written summaries of what was accomplished
+
+The plugin also surfaces manager feedback: replies on Slack threads are automatically injected into the developer's next Claude Code session.
 
 ## Quick Start
 
@@ -25,69 +28,61 @@ Invite the bot to your target channel:
 ### 2. Install the Plugin
 
 ```bash
-claude plugin add claude-report
+claude plugin install claude-report
 ```
 
 Claude Code will prompt for three values:
 
 | Prompt | Value |
 |--------|-------|
-| **Slack Bot Token** | `xoxb-...` from step 1 (stored in system keychain) |
+| **Slack Bot Token** | `xoxb-...` from step 1 |
 | **Slack Channel ID** | Channel ID from Slack channel details (e.g. `C0AS7LC0X9B`) |
 | **Display Name** | Your name as shown in Slack posts |
 
-### 3. Enable Your Git User
+### 3. Restart Claude Code
 
-By default, reporting is active for everyone. To restrict it to specific team members:
-
-```bash
-claude-report enable             # Enable for your current git user (auto-detected)
-claude-report enable ym259       # Or specify by name
-claude-report enable user@co.jp  # Or by email
-```
-
-Once at least one user is enabled, only enabled users emit updates. This works across all repos (GitHub, GitLab, Bitbucket — anything with git) without per-project setup.
-
-```bash
-claude-report users              # See who's enabled and your current git identity
-```
+The plugin's hooks and MCP server activate on session startup.
 
 ## How It Works
 
-**Deterministic hooks** (always fire):
+### Real-Time Activity Log
 
-| Event | Detection | Slack Post |
-|-------|-----------|------------|
-| Git push | `git push` command + success output | `Pushed to feat/auth` |
-| Git commit | `git commit` + commit message | `Committed: fix auth bug` |
-| PR creation | `gh pr create` + PR URL | `PR created: .../pull/42` |
-| Test failure | Test runner + failure indicators | `Tests failing: 3 failures` |
-| Task completion | Claude marks a task complete | `Task completed: Implement JWT auth` |
+Hooks fire on every Bash and TaskUpdate tool call. Detected events are posted as compact log entries to a **single daily thread per user**:
 
-**MCP tools** (LLM-driven, best-effort):
+```
+📋 Yuya — Activity Log (2026-04-15)
+  ├─ `Projects/claude-report` 🚀 Pushed to main
+  ├─ `valorize/valorize-app` 📝 Committed: fix Vercel build permission error
+  ├─ `firstlooptechnology/davie` ✅ Task completed: Add anomaly detection processor
+  └─ `Projects/claude-report` 🛑 Tests failing: 3 failures
+```
 
-Claude reads the CLAUDE.md instructions and calls `report_status`, `report_blocker`, or `report_done` at appropriate milestones. These provide richer context than hooks but are not guaranteed to fire.
+| Event | Icon | Example |
+|-------|------|---------|
+| Git push | 🚀 | `Pushed to main` |
+| Git commit | 📝 | `Committed: fix auth bug` |
+| PR creation | 📝 | `PR created: .../pull/42` |
+| Task completion | ✅ | `Task completed: Implement JWT auth` |
+| Test failure | 🛑 | `Tests failing: 3 failures` |
 
-**Manager feedback loop**:
+### End-of-Day Usage Report
+
+The `/usage` slash command (or `report_usage` MCP tool) parses local Claude Code transcript JSONL files and generates a daily summary:
+
+- **Token usage stats** — sessions, prompts (excluding internal tool calls), input/output tokens, estimated cost
+- **Per-project breakdown** — prompts and tokens per project with readable project paths
+- **AI-written summaries** — Claude reads commit messages, edited files, and user prompts to write a 1-line Japanese summary per project
+
+Schedule automatic daily posting with `/schedule-usage` or via launchd:
+
+```bash
+# macOS launchd (persists across restarts)
+# See the launchd setup section below
+```
+
+### Manager Feedback Loop
 
 When a manager replies to a Slack thread, the `UserPromptSubmit` hook fetches the reply (cached, 5-minute TTL) and injects it into the developer's next Claude Code prompt.
-
-### Slack Output
-
-Each developer gets **one thread per project per day**:
-
-```
-Claude Report  12:07 PM
-  Yuya Morita — 2026-04-12 · company-api
-    Committed: fix auth bug                    (feat/auth)
-    Pushed to feat/auth                        (3 files changed)
-    Tests failing: 3 failures
-    PR created: github.com/.../pull/42
-
-Claude Report  12:07 PM
-  Yuya Morita — 2026-04-12 · mobile-app
-    Task completed: Implement push notifications
-```
 
 ## Configuration
 
@@ -98,15 +93,11 @@ Create `.claude-report.json` in any project root:
 ```json
 {
   "notifications": {
+    "enabled": true,
     "onGitPush": true,
     "onBlocker": true,
     "onCompletion": true,
-    "verbosity": "normal"
-  },
-  "rateLimit": {
-    "minIntervalMs": 600000,
-    "maxPerSession": 10,
-    "maxPerDay": 30
+    "dryRun": false
   }
 }
 ```
@@ -114,14 +105,10 @@ Create `.claude-report.json` in any project root:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `notifications.enabled` | `boolean` | `true` | Master switch for all posting |
-| `notifications.onGitPush` | `boolean` | `true` | Post on git push |
-| `notifications.onBlocker` | `boolean` | `true` | Post on test failures |
-| `notifications.onCompletion` | `boolean` | `true` | Post on task/PR completion |
-| `notifications.verbosity` | `string` | `"normal"` | `"minimal"` \| `"normal"` \| `"verbose"` |
+| `notifications.onGitPush` | `boolean` | `true` | Include git push in activity log |
+| `notifications.onBlocker` | `boolean` | `true` | Include test failures |
+| `notifications.onCompletion` | `boolean` | `true` | Include task/PR completion |
 | `notifications.dryRun` | `boolean` | `false` | Log to file instead of posting |
-| `rateLimit.minIntervalMs` | `number` | `600000` | Minimum ms between status posts (10 min) |
-| `rateLimit.maxPerSession` | `number` | `10` | Max posts per session |
-| `rateLimit.maxPerDay` | `number` | `30` | Max posts per day per project |
 
 ### Disabling for a Project
 
@@ -134,28 +121,31 @@ Create a `.claude-report.ignore` file in the project root, or set `CLAUDE_REPORT
 | `CLAUDE_REPORT_SLACK_BOT_TOKEN` | Slack bot token (overrides plugin config) |
 | `CLAUDE_REPORT_SLACK_CHANNEL` | Slack channel ID |
 | `CLAUDE_REPORT_USER_NAME` | Display name |
+| `CLAUDE_REPORT_DATA_DIR` | Data directory path (overrides default) |
 | `CLAUDE_REPORT_DRY_RUN=1` | Enable dry-run mode |
 | `CLAUDE_REPORT_DISABLED=1` | Disable all posting |
 
 ## CLI
 
 ```bash
-claude-report enable [user]       # Enable reporting for a git user (default: current)
-claude-report disable [user]      # Disable reporting for a git user
-claude-report users               # List enabled users and current git identity
-claude-report post <message> -t <type>  # Manually post an update
-claude-report pause               # Mute posting for current project
-claude-report resume              # Unmute posting
-claude-report status              # Show session state and recent posts
+claude-report enable [user]              # Enable reporting for a git user
+claude-report disable [user]             # Disable reporting for a git user
+claude-report users                      # List enabled users
+claude-report post <message> -t <type>   # Manually post an update
+claude-report pause                      # Mute posting for current project
+claude-report resume                     # Unmute posting
+claude-report status                     # Show session state
 ```
 
-### Slash Command
+### Slash Commands
 
-Type `/report` in Claude Code to trigger a manual status update. Claude will summarize the current session and post to Slack.
+| Command | Description |
+|---------|-------------|
+| `/report` | Post a manual status update — Claude summarizes the session |
+| `/usage` | Post a daily token usage summary to Slack |
+| `/schedule-usage` | Set up automatic daily usage reporting |
 
 ### MCP Tools
-
-These tools are available to Claude when the plugin is active:
 
 | Tool | Description |
 |------|-------------|
@@ -163,21 +153,83 @@ These tools are available to Claude when the plugin is active:
 | `report_blocker` | Shorthand for blocker reports |
 | `report_done` | Shorthand for completion reports |
 | `fetch_feedback` | Fetch manager replies from the Slack thread |
-| `report_mute` | Pause posting for the current session |
-| `report_unmute` | Resume posting |
+| `report_usage` | Get daily usage stats and per-project activity snippets |
+| `post_usage_to_slack` | Post usage summary with AI-generated project summaries |
+| `report_mute` / `report_unmute` | Pause/resume posting |
+
+## Scheduling the Daily Report
+
+### Option A: In-Session (session-only)
+
+```
+/schedule-usage
+```
+
+Creates a cron job at 19:00 local time. Dies when the Claude Code session ends.
+
+### Option B: macOS launchd (persistent)
+
+Create `~/Library/LaunchAgents/com.claude-report.daily-usage.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-report.daily-usage</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/claude</string>
+        <string>-p</string>
+        <string>Call report_usage for today's date. Write 1-line Japanese summaries per project, then call post_usage_to_slack.</string>
+        <string>--plugin-dir</string>
+        <string>/path/to/claude-report</string>
+        <string>--permission-mode</string>
+        <string>bypassPermissions</string>
+        <string>--model</string>
+        <string>sonnet</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/claude-report</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>19</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/yourname</string>
+        <key>CLAUDE_REPORT_DATA_DIR</key>
+        <string>/Users/yourname/.claude/plugins/data/claude-report-claude-report-marketplace</string>
+    </dict>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.claude-report.daily-usage.plist
+```
 
 ## Safety & Privacy
 
-- **Content filter**: Secrets (AWS keys, JWTs, Slack tokens, GitHub PATs) and absolute file paths are automatically redacted before posting
-- **Rate limiting**: 10-minute interval between posts, 10 per session, 30 per day. Blockers and completions bypass the interval limit
+- **Content filter**: secrets (AWS keys, JWTs, Slack tokens, GitHub PATs, Stripe keys), `key=value` patterns, and absolute file paths are automatically redacted before posting
+- **Slack mrkdwn escaping**: user-controlled text is sanitized to prevent formatting injection
+- **Prompt injection mitigation**: Slack reply text is sanitized and boundary-marked before injection into Claude's context
 - **Mute controls**: `claude-report pause`, `report_mute` MCP tool, `.claude-report.ignore` file, or `CLAUDE_REPORT_DISABLED=1`
-- **User-based access control**: Enable/disable reporting per git user. Works across all repos
-- **Credential storage**: Slack bot token is stored in the system keychain, never in config files
+- **User-based access control**: enable/disable reporting per git user across all repos
+- **File locking**: advisory locks prevent concurrent hook processes from corrupting session state
 
 ## Development
 
 ```bash
-git clone https://github.com/anthropics/claude-report
+git clone https://github.com/knorq-ai/claude-report
 cd claude-report
 npm install
 npm run build
