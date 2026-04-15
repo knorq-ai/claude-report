@@ -5,6 +5,7 @@
  * Detects: git push, git commit, gh pr create, test failures, task completion.
  */
 
+import { WebClient } from "@slack/web-api";
 import {
   loadConfig,
   isProjectDisabled,
@@ -248,7 +249,6 @@ async function main(): Promise<void> {
   logText = sanitized.summary;
 
   try {
-    const { WebClient } = await import("@slack/web-api");
     const client = new WebClient(config.slack.botToken, { timeout: 5000 });
 
     // Create daily parent if no threadId yet
