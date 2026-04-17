@@ -275,36 +275,95 @@ function loadAndMerge(
 
   let data = result.data as Record<string, unknown>;
   if (source === "project") {
-    // Project-level config is UNTRUSTED (a malicious repo can ship it).
-    // Strip ALL fields that could redirect posts, exfiltrate data, or hijack
-    // identity. `slack.channel` looks like a "routing hint" but a hostile repo
-    // can point posts at the attacker's channel and silently exfiltrate dev
-    // activity — so even the channel is not allowed at project scope.
-    //
-    // Whitelist approach: project config can ONLY influence notification
-    // toggles and rate-limit tuning. Everything else is ignored with a log.
-    const ALLOWED_PROJECT_KEYS = new Set(["notifications", "rateLimit"]);
-    const stripped: string[] = [];
-    const safe: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(data)) {
-      if (ALLOWED_PROJECT_KEYS.has(key)) {
-        safe[key] = value;
-      } else {
-        stripped.push(key);
-      }
-    }
-    if (stripped.length > 0) {
-      console.error(
-        `[claude-report] Ignoring project-config fields (${stripped.join(", ")}) at ${filePath} — only notifications/rateLimit are honored at project scope.`,
-      );
-    }
-    data = safe;
+    data = sanitizeProjectConfig(data, filePath);
   }
 
   deepMerge(
     target as unknown as Record<string, unknown>,
     data,
   );
+}
+
+/**
+ * Sanitize untrusted project-level `.claude-report.json` by enforcing a
+ * strict policy that prevents sabotage and spam from a malicious repo:
+ *
+ * Allowed:
+ *   - `notifications.onGitPush` / `onBlocker` / `onCompletion` / `verbosity`
+ *     (per-event toggles — project maintainer can disable specific event
+ *     types for repos that are too noisy)
+ *   - `rateLimit.*`, but CLAMPED to safe bounds (no zero-interval spam;
+ *     no million-post caps)
+ *
+ * Rejected at project scope (with stderr log):
+ *   - `notifications.enabled` — would silence all reporting (sabotage)
+ *   - `notifications.dryRun`  — would silently drop posts (sabotage + stealth)
+ *   - Everything outside `notifications` / `rateLimit` (slack/relay/user)
+ */
+function sanitizeProjectConfig(
+  data: Record<string, unknown>,
+  filePath: string,
+): Record<string, unknown> {
+  const stripped: string[] = [];
+  const safe: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(data)) {
+    if (key === "notifications" && value && typeof value === "object") {
+      const notif = value as Record<string, unknown>;
+      const safeNotif: Record<string, unknown> = {};
+      for (const [nk, nv] of Object.entries(notif)) {
+        if (nk === "enabled" || nk === "dryRun") {
+          stripped.push(`notifications.${nk}`);
+        } else {
+          safeNotif[nk] = nv;
+        }
+      }
+      if (Object.keys(safeNotif).length > 0) safe.notifications = safeNotif;
+    } else if (key === "rateLimit" && value && typeof value === "object") {
+      safe.rateLimit = clampRateLimit(value as Record<string, unknown>);
+    } else {
+      stripped.push(key);
+    }
+  }
+
+  if (stripped.length > 0) {
+    console.error(
+      `[claude-report] Ignoring unsafe project-config fields (${stripped.join(", ")}) at ${filePath}.`,
+    );
+  }
+  return safe;
+}
+
+/**
+ * Clamp project-supplied rateLimit values to safe bounds so a malicious repo
+ * cannot flood the team Slack channel by setting maxPerDay=1e9.
+ *
+ * Minimums prevent sabotage (e.g., minIntervalMs too high to ever fire).
+ * Maximums prevent spam (e.g., maxPerSession too high to ever rate-limit).
+ */
+function clampRateLimit(raw: Record<string, unknown>): Record<string, unknown> {
+  const clamp = (v: unknown, min: number, max: number): number | undefined => {
+    if (typeof v !== "number" || !Number.isFinite(v)) return undefined;
+    return Math.min(Math.max(v, min), max);
+  };
+  const out: Record<string, unknown> = {};
+  const minIntervalMs = clamp(raw.minIntervalMs, 60_000, 86_400_000); // 1 min – 24 h
+  const maxPerSession = clamp(raw.maxPerSession, 1, 100);
+  const maxPerDay = clamp(raw.maxPerDay, 1, 500);
+  const deduplicationWindowMs = clamp(raw.deduplicationWindowMs, 60_000, 86_400_000);
+  if (minIntervalMs !== undefined) out.minIntervalMs = minIntervalMs;
+  if (maxPerSession !== undefined) out.maxPerSession = maxPerSession;
+  if (maxPerDay !== undefined) out.maxPerDay = maxPerDay;
+  if (deduplicationWindowMs !== undefined) out.deduplicationWindowMs = deduplicationWindowMs;
+  // bypassTypes: only allow a known-safe subset (never let project config add
+  // "status" as a bypass which would let every status post skip rate limits)
+  if (Array.isArray(raw.bypassTypes)) {
+    const allowed = new Set(["blocker", "completion"]);
+    out.bypassTypes = raw.bypassTypes.filter(
+      (t) => typeof t === "string" && allowed.has(t),
+    );
+  }
+  return out;
 }
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);

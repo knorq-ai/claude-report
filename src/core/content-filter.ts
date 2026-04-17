@@ -27,44 +27,87 @@ interface SecretPattern {
   flags: string;
 }
 
+/**
+ * All secret patterns use the `i` flag. Historical wisdom says token prefixes
+ * like `AKIA`, `ghp_`, `sk-` are "always uppercase/lowercase" — but attackers
+ * can trivially lowercase them in a commit message to bypass detection. Since
+ * our patterns are specific enough that case-insensitivity doesn't cause
+ * false-positives, we default everything to `gi`.
+ */
 const SECRET_PATTERNS: SecretPattern[] = [
-  // AWS
-  { source: "AKIA[0-9A-Z]{16}", flags: "g" },
+  // AWS access key id
+  { source: "AKIA[0-9A-Z]{16}", flags: "gi" },
   // AWS secret (40-char base64). Require at least one non-hex character
-  // ([G-Zg-z] or `/` `+`) to avoid matching 40-char git SHAs.
+  // to avoid matching 40-char git SHAs.
   { source: "(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]*[G-Zg-z/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])", flags: "g" },
   // Slack
-  { source: "xox[baprs]-[0-9A-Za-z-]{10,}", flags: "g" },
+  { source: "xox[baprs]-[0-9A-Za-z-]{10,}", flags: "gi" },
   // GitHub
-  { source: "ghp_[A-Za-z0-9]{36,}", flags: "g" },
-  { source: "github_pat_[A-Za-z0-9_]{20,}", flags: "g" },
-  { source: "gh[ousr]_[A-Za-z0-9]{20,}", flags: "g" },
+  { source: "ghp_[A-Za-z0-9]{36,}", flags: "gi" },
+  { source: "github_pat_[A-Za-z0-9_]{20,}", flags: "gi" },
+  { source: "gh[ousr]_[A-Za-z0-9]{20,}", flags: "gi" },
   // LLM providers
-  { source: "sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}", flags: "g" },
-  { source: "AIza[0-9A-Za-z_-]{35}", flags: "g" },
+  { source: "sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}", flags: "gi" },
+  { source: "AIza[0-9A-Za-z_-]{35}", flags: "gi" },
   // Stripe
-  { source: "sk_(?:live|test)_[A-Za-z0-9]{20,}", flags: "g" },
-  { source: "rk_(?:live|test)_[A-Za-z0-9]{20,}", flags: "g" },
+  { source: "sk_(?:live|test)_[A-Za-z0-9]{20,}", flags: "gi" },
+  { source: "rk_(?:live|test)_[A-Za-z0-9]{20,}", flags: "gi" },
   // NPM
-  { source: "npm_[A-Za-z0-9]{36,}", flags: "g" },
+  { source: "npm_[A-Za-z0-9]{36,}", flags: "gi" },
   // JWT — 2-part or 3-part; bounded {10,2048} per segment prevents backtracking.
-  { source: "eyJ[A-Za-z0-9_-]{10,2048}\\.[A-Za-z0-9_-]{10,2048}(?:\\.[A-Za-z0-9_-]{10,2048})?", flags: "g" },
+  { source: "eyJ[A-Za-z0-9_-]{10,2048}\\.[A-Za-z0-9_-]{10,2048}(?:\\.[A-Za-z0-9_-]{10,2048})?", flags: "gi" },
   // Private keys — three tiers to handle malformed/truncated PEMs.
-  { source: "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----[\\s\\S]{0,8192}?-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----", flags: "g" },
-  { source: "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----[\\s\\S]{0,8192}?-----END [A-Z0-9 ]+-----", flags: "g" },
-  { source: "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----(?:[ \\t]*\\n[A-Za-z0-9+/=\\s]{0,8192})?", flags: "g" },
-  // Azure / cloud connection strings (keyword case-insensitive)
+  { source: "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----[\\s\\S]{0,8192}?-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----", flags: "gi" },
+  { source: "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----[\\s\\S]{0,8192}?-----END [A-Z0-9 ]+-----", flags: "gi" },
+  { source: "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----(?:[ \\t]*\\n[A-Za-z0-9+/=\\s]{0,8192})?", flags: "gi" },
+  // Azure / cloud connection strings
   { source: "DefaultEndpointsProtocol=[^\\s\"']+AccountKey=[^\\s\"';]+", flags: "gi" },
   // URL basic-auth — redact entire URL (host/path reveals internal infra)
-  { source: "[a-zA-Z][a-zA-Z0-9+.-]*:\\/\\/[^:/?#\\s\"']+:[^@/?#\\s\"']+@[^\\s\"'<>]+", flags: "g" },
+  { source: "[a-zA-Z][a-zA-Z0-9+.-]*:\\/\\/[^:/?#\\s\"']+:[^@/?#\\s\"']+@[^\\s\"'<>]+", flags: "gi" },
   // Bearer tokens in Authorization headers
   { source: "bearer\\s+[A-Za-z0-9_\\-\\.=+/]{16,}", flags: "gi" },
-  // Named key=value secrets — CASE INSENSITIVE because `Password=`, `PW=`,
-  // `ApiKey=` are all real in logs and must redact.
+  // Named key=value secrets. ALSO allows a surrounding wider separator match
+  // (any whitespace, including no space) — and accepts Unicode = fullwidth
+  // equivalents via NFKC normalization applied before matching (see filter()).
   { source: "(?:password|passwd|pwd|pw|secret|token|credentials|api[_-]?key|auth[_-]?token|access[_-]?token|access[_-]?key|refresh[_-]?token|client[_-]?secret|session[_-]?key|private[_-]?key)\\s*[=:]\\s*[\"']?[^\\s\"'{}<>,;]+", flags: "gi" },
+  // Base64-wrapped secrets: 48+ chars of base64 alphabet that must include
+  // at least one `+`/`/` (standard base64) OR end with `=` padding — these
+  // are strong signals of binary base64, not incidental text like "yyyy...".
+  // Still avoids eating plain long words/repeated chars.
+  { source: "(?<![A-Za-z0-9+/=])(?=[A-Za-z0-9+/]*[+/]|[A-Za-z0-9+/]{48,}=)[A-Za-z0-9+/]{48,}={0,2}(?![A-Za-z0-9+/=])", flags: "g" },
   // Long hex strings last (avoids eating git SHAs which are ≤40 hex)
-  { source: "(?<![a-f0-9])[a-f0-9]{64,}(?![a-f0-9])", flags: "g" },
+  { source: "(?<![a-f0-9])[a-f0-9]{64,}(?![a-f0-9])", flags: "gi" },
 ];
+
+/**
+ * Invisible / formatting Unicode characters often used to split secret
+ * patterns (e.g., `AKIA\u200BIOSFO...`). Stripped before scanning.
+ *
+ * - U+200B ZERO WIDTH SPACE
+ * - U+200C ZERO WIDTH NON-JOINER
+ * - U+200D ZERO WIDTH JOINER
+ * - U+FEFF ZERO WIDTH NO-BREAK SPACE (BOM)
+ * - U+2060 WORD JOINER
+ * - U+00AD SOFT HYPHEN
+ * - U+180E MONGOLIAN VOWEL SEPARATOR
+ * - U+034F COMBINING GRAPHEME JOINER
+ */
+const INVISIBLE_CHARS_RE = /[\u200B-\u200D\u2060\u00AD\uFEFF\u180E\u034F]/g;
+
+/**
+ * Normalize text before secret scanning:
+ *   1. Unicode NFKC — collapses fullwidth `＝` → ASCII `=`, `Ｐ` → `P`, etc.
+ *   2. Strip invisible/formatting chars that split regex matches.
+ *
+ * We run the filter on the NORMALIZED text but preserve the original for
+ * the final output — the replacements happen on the original indices using
+ * match positions from the normalized scan. Simpler approach: replace both
+ * normalized and original; the normalized form is what the user sees in
+ * Slack anyway (readable).
+ */
+function normalizeForScan(text: string): string {
+  return text.normalize("NFKC").replace(INVISIBLE_CHARS_RE, "");
+}
 
 /**
  * Compile fresh RegExp instances on every call. This is cheap for our
@@ -98,9 +141,12 @@ export class ContentFilter {
       filtered.details = truncate(filtered.details, MAX_DETAILS_LENGTH);
     }
 
-    filtered.summary = stripSecrets(filtered.summary);
+    // Normalize BEFORE scanning (collapses fullwidth chars, strips invisible
+    // separators) AND before output — the user sees the normalized form in
+    // Slack. Normalized text also means less room for obfuscation games.
+    filtered.summary = stripSecrets(normalizeForScan(filtered.summary));
     if (filtered.details) {
-      filtered.details = stripSecrets(filtered.details);
+      filtered.details = stripSecrets(normalizeForScan(filtered.details));
     }
 
     filtered.summary = sanitizePaths(filtered.summary);
@@ -111,9 +157,13 @@ export class ContentFilter {
     return filtered;
   }
 
-  /** Check if text appears to contain secrets. */
+  /**
+   * Check if text appears to contain secrets. Normalizes before scanning so
+   * obfuscated variants (fullwidth, ZWSP) are detected.
+   */
   containsSecrets(text: string): boolean {
-    return compilePatterns().some((pattern) => pattern.test(text));
+    const normalized = normalizeForScan(text);
+    return compilePatterns().some((pattern) => pattern.test(normalized));
   }
 }
 

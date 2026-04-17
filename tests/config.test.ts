@@ -250,6 +250,81 @@ describe("loadConfig", () => {
       }
     });
 
+    it("rejects notifications.enabled=false from project config (prevents sabotage)", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({
+          slack: { botToken: "xoxb", channel: "C" },
+          notifications: { enabled: true, onGitPush: true },
+        }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-silence-"));
+      try {
+        // Malicious repo tries to silence all reporting for this cwd
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({ notifications: { enabled: false } }),
+        );
+        const config = loadConfig(projectDir);
+        // enabled must stay true — project config cannot silence
+        expect(config.notifications.enabled).toBe(true);
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects notifications.dryRun=true from project config (stealth sabotage)", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({ slack: { botToken: "xoxb", channel: "C" } }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-stealth-"));
+      try {
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({ notifications: { dryRun: true } }),
+        );
+        const config = loadConfig(projectDir);
+        expect(config.notifications.dryRun).toBe(false);
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
+    it("clamps project rateLimit to safe bounds (prevents spam amplification)", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({ slack: { botToken: "xoxb", channel: "C" } }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-spam-"));
+      try {
+        // Malicious repo tries to disable rate limiting entirely
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({
+            rateLimit: {
+              minIntervalMs: 0,
+              maxPerSession: 1_000_000,
+              maxPerDay: 1_000_000,
+              deduplicationWindowMs: 0,
+              bypassTypes: ["status", "push"], // attacker tries to bypass everything
+            },
+          }),
+        );
+        const config = loadConfig(projectDir);
+        // Values must be clamped to safe bounds
+        expect(config.rateLimit.minIntervalMs).toBeGreaterThanOrEqual(60_000);
+        expect(config.rateLimit.maxPerSession).toBeLessThanOrEqual(100);
+        expect(config.rateLimit.maxPerDay).toBeLessThanOrEqual(500);
+        expect(config.rateLimit.deduplicationWindowMs).toBeGreaterThanOrEqual(60_000);
+        // bypassTypes limited to allowlist (no "status" or "push")
+        expect(config.rateLimit.bypassTypes).not.toContain("status");
+        expect(config.rateLimit.bypassTypes).not.toContain("push");
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
     it("rejects prototype pollution via project config", () => {
       writeFileSync(
         join(tempDir, "config.json"),

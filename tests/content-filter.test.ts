@@ -196,6 +196,52 @@ describe("ContentFilter", () => {
     });
   });
 
+  describe("obfuscation bypass defenses", () => {
+    it("redacts lowercase AWS access keys (akia...)", () => {
+      const result = filter.filter(
+        makeUpdate({ summary: "key = akiaIOSFODNN7example" }),
+      );
+      expect(result.summary).not.toContain("akiaIOSFODNN7example");
+      expect(result.summary).toContain("[REDACTED]");
+    });
+
+    it("redacts AKIA split by zero-width space", () => {
+      const result = filter.filter(
+        makeUpdate({ summary: "key=AKIA\u200BIOSFODNN7EXAMPLE" }),
+      );
+      expect(result.summary).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    });
+
+    it("redacts fullwidth = separator: password＝hunter2", () => {
+      // Fullwidth = (U+FF1D) should normalize to ASCII = before scanning
+      const result = filter.filter(
+        makeUpdate({ summary: "password＝hunter2supersecret" }),
+      );
+      expect(result.summary).not.toContain("hunter2supersecret");
+    });
+
+    it("redacts base64-wrapped secrets (48+ chars with +/= signals)", () => {
+      // Realistic 56-char base64 with `+` and `=` — signature of binary data
+      const b64 = "ZGVhZGJlZWZkZWFkYmVlZmRlYWRiZWVmZGVhZGJlZWZkZWFk+YmVlZg==";
+      const result = filter.filter(makeUpdate({ summary: `creds: ${b64}` }));
+      expect(result.summary).toContain("[REDACTED]");
+      expect(result.summary).not.toContain(b64);
+    });
+
+    it("does NOT redact repeated letters (not real base64)", () => {
+      const result = filter.filter(makeUpdate({ summary: "y".repeat(100) }));
+      // 100 `y`s — no +/= → should not trigger base64 pattern
+      expect(result.summary).not.toContain("[REDACTED]");
+    });
+
+    it("case-insensitive matching for named secrets (Password= / PW= / SECRET=)", () => {
+      for (const variant of ["Password=hunter2abc", "PW=hunter2abcdef", "SECRET=myproductkey"]) {
+        const result = filter.filter(makeUpdate({ summary: variant }));
+        expect(result.summary, variant).toContain("[REDACTED]");
+      }
+    });
+  });
+
   describe("grapheme-safe truncation", () => {
     it("does not corrupt emoji across truncation boundary", () => {
       // 50 grinning-face emoji = 100 UTF-16 code units, 50 code points

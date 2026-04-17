@@ -453,15 +453,49 @@ async function main(): Promise<void> {
  * concurrent hooks both POST parent messages.
  *
  * Algorithm: under the session lock, check for existing threadId:
- *   - Non-null and not claim marker → reuse
- *   - Claim marker → another hook is posting; wait and re-read
- *   - Null → we claim by writing the marker, release the lock, POST, then
- *     commit the real threadId under lock again
+ *   - Non-null and not a claim marker → reuse
+ *   - Claim marker with LIVE owner and fresh → wait and re-read
+ *   - Claim marker with DEAD owner or STALE (>60s) → steal and claim fresh
+ *   - Null → we claim by writing a PID+timestamp marker, release the lock,
+ *     POST, then commit the real threadId under lock again
+ *
+ * Claim markers encode `__claiming__:<pid>:<unix-ms>` so a crashed claimant
+ * (SIGKILL mid-hook) doesn't wedge posting until midnight. Any subsequent
+ * hook that sees a stuck claim with a dead PID or >60s timestamp steals it.
  *
  * The lock is held only for brief reads/writes — never across the Slack POST —
  * so contention is low.
  */
-const CLAIM_MARKER = "__claiming__";
+const CLAIM_PREFIX = "__claiming__";
+const CLAIM_STALE_MS = 60_000;
+
+function makeClaim(): string {
+  return `${CLAIM_PREFIX}:${process.pid}:${Date.now()}`;
+}
+
+/**
+ * Parse a claim marker. Returns null if the string is not a claim marker or is
+ * malformed. Returns `{stale: true}` if the owner is dead or the claim is
+ * older than CLAIM_STALE_MS — callers should treat this as "claim is free".
+ */
+function parseClaim(threadId: string | null): { stale: boolean } | null {
+  if (!threadId || !threadId.startsWith(CLAIM_PREFIX)) return null;
+  const parts = threadId.split(":");
+  if (parts.length !== 3) return { stale: true }; // malformed — treat as stale
+  const pid = Number.parseInt(parts[1], 10);
+  const ts = Number.parseInt(parts[2], 10);
+  if (!Number.isFinite(pid) || !Number.isFinite(ts)) return { stale: true };
+  const ageMs = Date.now() - ts;
+  if (ageMs > CLAIM_STALE_MS) return { stale: true };
+  // Check if owner is alive. In dead-pid case, treat as stale.
+  try {
+    process.kill(pid, 0);
+    return { stale: false };
+  } catch (err: any) {
+    if (err?.code === "ESRCH") return { stale: true }; // dead
+    return { stale: false }; // EPERM — owned by another user/process; assume alive
+  }
+}
 
 async function acquireThreadId(
   userId: string,
@@ -471,37 +505,65 @@ async function acquireThreadId(
   safeUserName: string,
   today: string,
 ): Promise<string | null> {
-  if (existingThreadId && existingThreadId !== CLAIM_MARKER) return existingThreadId;
+  if (existingThreadId && parseClaim(existingThreadId) === null) return existingThreadId;
 
   type State = "reuse" | "claimed" | "wait";
+  const myClaim = makeClaim();
 
   const claim: { state: State; existing?: string } = withFileLock(sessionFilePathFor(userId), () => {
     const cur = readSessionJson(userId);
-    if (!cur) return { state: "claimed" as State }; // session file gone; create claim on next update
-    if (cur.threadId && cur.threadId !== CLAIM_MARKER) {
+    if (!cur) return { state: "claimed" as State };
+
+    const claimInfo = parseClaim(cur.threadId);
+    if (cur.threadId && claimInfo === null) {
+      // Real threadId — use it
       return { state: "reuse" as State, existing: cur.threadId };
     }
-    if (cur.threadId === CLAIM_MARKER) {
+    if (claimInfo && !claimInfo.stale) {
+      // Another live hook is posting the parent; wait for it
       return { state: "wait" as State };
     }
-    // Claim the slot by writing CLAIM_MARKER under lock.
-    updateSessionForProject(userId, "activity-log", { threadId: CLAIM_MARKER });
+    // Either no threadId, or a stale/dead claim — claim the slot.
+    updateSessionForProject(userId, "activity-log", { threadId: myClaim });
     return { state: "claimed" as State };
   });
 
   if (claim.state === "reuse") return claim.existing!;
 
   if (claim.state === "wait") {
-    // Another hook is creating the parent. Poll briefly for the resolved threadId.
+    // Poll briefly for the resolved threadId; steal on stale mid-wait.
     const WAIT_POLL_MS = 150;
     const WAIT_MAX_ATTEMPTS = 20; // ~3 seconds
     for (let i = 0; i < WAIT_MAX_ATTEMPTS; i++) {
       await new Promise((r) => setTimeout(r, WAIT_POLL_MS));
       const cur = readSessionJson(userId);
-      if (cur?.threadId && cur.threadId !== CLAIM_MARKER) return cur.threadId;
+      if (!cur) continue;
+      const info = parseClaim(cur.threadId);
+      if (cur.threadId && info === null) return cur.threadId; // resolved
+      if (info && info.stale) {
+        // Claimant died or stalled — try to steal
+        const stolen = withFileLock(sessionFilePathFor(userId), () => {
+          const latest = readSessionJson(userId);
+          const latestInfo = parseClaim(latest?.threadId ?? null);
+          if (latestInfo && latestInfo.stale) {
+            updateSessionForProject(userId, "activity-log", { threadId: myClaim });
+            return true;
+          }
+          return false;
+        });
+        if (stolen) break; // fall through to POST parent
+        // Someone else stole first; continue polling
+      }
     }
-    // Claimant is stuck — don't risk a duplicate parent; skip this post.
-    return null;
+    // Re-read: are we the claimant now?
+    const cur = readSessionJson(userId);
+    if (cur?.threadId !== myClaim) {
+      // Either resolved by someone else, or still stuck — return what we see
+      const info = parseClaim(cur?.threadId ?? null);
+      if (cur?.threadId && info === null) return cur.threadId;
+      return null; // give up for this invocation
+    }
+    // We stole — fall through to the POST path below
   }
 
   // We claimed — POST the parent, then commit the real threadId.
@@ -518,26 +580,32 @@ async function acquireThreadId(
       }],
     });
     if (!parent.ts) {
-      releaseClaim(userId);
+      releaseClaim(userId, myClaim);
       process.stderr.write(`[claude-report] parent post returned no ts\n`);
       return null;
     }
     updateSessionForProject(userId, "activity-log", { threadId: parent.ts });
     return parent.ts;
   } catch (err) {
-    releaseClaim(userId);
+    releaseClaim(userId, myClaim);
     process.stderr.write(`[claude-report] parent post failed: ${err instanceof Error ? err.message : err}\n`);
     return null;
   }
 }
 
-/** Release a claim so the next hook can retry creating the parent. */
-function releaseClaim(userId: string): void {
+/**
+ * Release OUR claim so the next hook can retry. Only clears if the current
+ * threadId is still our specific claim marker — otherwise someone else may
+ * have legitimately taken over.
+ */
+function releaseClaim(userId: string, myClaim: string): void {
   try {
-    const cur = readSessionJson(userId);
-    if (cur?.threadId === CLAIM_MARKER) {
-      updateSessionForProject(userId, "activity-log", { threadId: null });
-    }
+    withFileLock(sessionFilePathFor(userId), () => {
+      const cur = readSessionJson(userId);
+      if (cur?.threadId === myClaim) {
+        updateSessionForProject(userId, "activity-log", { threadId: null });
+      }
+    });
   } catch { /* best-effort */ }
 }
 
