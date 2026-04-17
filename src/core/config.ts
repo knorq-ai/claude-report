@@ -307,12 +307,21 @@ function sanitizeProjectConfig(
   const stripped: string[] = [];
   const safe: Record<string, unknown> = {};
 
+  // Fields a project config CANNOT change (would enable sabotage):
+  //   - `enabled`    : silence all posts
+  //   - `dryRun`     : stealth silence (posts go to local log, never Slack)
+  //   - `onBlocker`  : hide test-failure/blocker alerts (critical signal)
+  //   - `onCompletion`: hide task-completion alerts
+  // Fields a project config CAN change (legitimate repo-level customization):
+  //   - `onGitPush`  : noisy repos with lots of branch pushes
+  //   - `verbosity`  : short/long messages
+  const FORBIDDEN_NOTIF_KEYS = new Set(["enabled", "dryRun", "onBlocker", "onCompletion"]);
   for (const [key, value] of Object.entries(data)) {
     if (key === "notifications" && value && typeof value === "object") {
       const notif = value as Record<string, unknown>;
       const safeNotif: Record<string, unknown> = {};
       for (const [nk, nv] of Object.entries(notif)) {
-        if (nk === "enabled" || nk === "dryRun") {
+        if (FORBIDDEN_NOTIF_KEYS.has(nk)) {
           stripped.push(`notifications.${nk}`);
         } else {
           safeNotif[nk] = nv;

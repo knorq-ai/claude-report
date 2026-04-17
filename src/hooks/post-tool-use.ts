@@ -486,7 +486,9 @@ function parseClaim(threadId: string | null): { stale: boolean } | null {
   const ts = Number.parseInt(parts[2], 10);
   if (!Number.isFinite(pid) || !Number.isFinite(ts)) return { stale: true };
   const ageMs = Date.now() - ts;
-  if (ageMs > CLAIM_STALE_MS) return { stale: true };
+  // Negative age = future-dated timestamp (clock skew or corrupt marker).
+  // Treat as stale to prevent a garbage marker from wedging posts indefinitely.
+  if (ageMs < 0 || ageMs > CLAIM_STALE_MS) return { stale: true };
   // Check if owner is alive. In dead-pid case, treat as stale.
   try {
     process.kill(pid, 0);

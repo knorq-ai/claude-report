@@ -66,10 +66,13 @@ const SECRET_PATTERNS: SecretPattern[] = [
   { source: "[a-zA-Z][a-zA-Z0-9+.-]*:\\/\\/[^:/?#\\s\"']+:[^@/?#\\s\"']+@[^\\s\"'<>]+", flags: "gi" },
   // Bearer tokens in Authorization headers
   { source: "bearer\\s+[A-Za-z0-9_\\-\\.=+/]{16,}", flags: "gi" },
-  // Named key=value secrets. ALSO allows a surrounding wider separator match
-  // (any whitespace, including no space) — and accepts Unicode = fullwidth
-  // equivalents via NFKC normalization applied before matching (see filter()).
-  { source: "(?:password|passwd|pwd|pw|secret|token|credentials|api[_-]?key|auth[_-]?token|access[_-]?token|access[_-]?key|refresh[_-]?token|client[_-]?secret|session[_-]?key|private[_-]?key)\\s*[=:]\\s*[\"']?[^\\s\"'{}<>,;]+", flags: "gi" },
+  // Named key=value secrets. Handles:
+  //   - bare: `password=hunter2`
+  //   - JSON-like: `"password": "hunter2"` (optional `"`/`'` before separator)
+  //   - YAML-like: `password: hunter2`
+  // Separator accepts Unicode fullwidth via pre-scan NFKC normalization.
+  // Fullwidth colon U+FF1A is also normalized to ASCII `:` by NFKC.
+  { source: "(?:password|passwd|pwd|pw|secret|token|credentials|api[_-]?key|auth[_-]?token|access[_-]?token|access[_-]?key|refresh[_-]?token|client[_-]?secret|session[_-]?key|private[_-]?key)[\"']?\\s*[=:]\\s*[\"']?[^\\s\"'{}<>,;]+", flags: "gi" },
   // Base64-wrapped secrets: 48+ chars of base64 alphabet that must include
   // at least one `+`/`/` (standard base64) OR end with `=` padding — these
   // are strong signals of binary base64, not incidental text like "yyyy...".
@@ -82,31 +85,53 @@ const SECRET_PATTERNS: SecretPattern[] = [
 /**
  * Invisible / formatting Unicode characters often used to split secret
  * patterns (e.g., `AKIA\u200BIOSFO...`). Stripped before scanning.
- *
- * - U+200B ZERO WIDTH SPACE
- * - U+200C ZERO WIDTH NON-JOINER
- * - U+200D ZERO WIDTH JOINER
- * - U+FEFF ZERO WIDTH NO-BREAK SPACE (BOM)
- * - U+2060 WORD JOINER
- * - U+00AD SOFT HYPHEN
- * - U+180E MONGOLIAN VOWEL SEPARATOR
- * - U+034F COMBINING GRAPHEME JOINER
  */
 const INVISIBLE_CHARS_RE = /[\u200B-\u200D\u2060\u00AD\uFEFF\u180E\u034F]/g;
 
 /**
- * Normalize text before secret scanning:
- *   1. Unicode NFKC — collapses fullwidth `＝` → ASCII `=`, `Ｐ` → `P`, etc.
- *   2. Strip invisible/formatting chars that split regex matches.
+ * Latin-lookalike characters from Cyrillic, Greek, and full-width blocks that
+ * NFKC does NOT collapse. An attacker can write `АKIA...` (Cyrillic А U+0410)
+ * to bypass literal prefix patterns — NFKC keeps Cyrillic and Latin separate
+ * by design. We transliterate the common visual lookalikes to their Latin
+ * equivalents before scanning.
  *
- * We run the filter on the NORMALIZED text but preserve the original for
- * the final output — the replacements happen on the original indices using
- * match positions from the normalized scan. Simpler approach: replace both
- * normalized and original; the normalized form is what the user sees in
- * Slack anyway (readable).
+ * Reference: Unicode Technical Report #36 "Unicode Security Considerations".
+ */
+const HOMOGLYPH_MAP: Record<string, string> = {
+  // Cyrillic uppercase → Latin (visually identical)
+  "А": "A", "В": "B", "Е": "E", "Н": "H", "К": "K", "М": "M", "О": "O",
+  "Р": "P", "С": "C", "Т": "T", "Х": "X", "І": "I", "Ј": "J", "Ѕ": "S",
+  "Ү": "Y", "Ғ": "F", "Ԁ": "D", "Ԛ": "Q",
+  // Cyrillic lowercase → Latin
+  "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y",
+  "і": "i", "ј": "j", "ѕ": "s", "һ": "h",
+  // Greek uppercase → Latin lookalikes
+  "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K",
+  "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
+  // Greek lowercase
+  "α": "a", "ο": "o", "ρ": "p",
+};
+const HOMOGLYPH_RE = new RegExp(
+  `[${Object.keys(HOMOGLYPH_MAP).join("")}]`,
+  "gu",
+);
+
+/**
+ * Normalize text before secret scanning:
+ *   1. Unicode NFKC — collapses fullwidth `＝` → ASCII `=`, `Ｐ` → `P`.
+ *   2. Transliterate Cyrillic/Greek Latin-lookalikes to their Latin equivalents.
+ *   3. Strip invisible/formatting chars that split regex matches.
+ *
+ * The normalized form is what gets scanned AND what appears in output; this
+ * is intentional — we want the user to see the normalized text in Slack so
+ * they notice the obfuscation attempt (and because normalized text is more
+ * readable anyway).
  */
 function normalizeForScan(text: string): string {
-  return text.normalize("NFKC").replace(INVISIBLE_CHARS_RE, "");
+  return text
+    .normalize("NFKC")
+    .replace(HOMOGLYPH_RE, (c) => HOMOGLYPH_MAP[c] || c)
+    .replace(INVISIBLE_CHARS_RE, "");
 }
 
 /**

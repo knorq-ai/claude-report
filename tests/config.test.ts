@@ -273,6 +273,72 @@ describe("loadConfig", () => {
       }
     });
 
+    it("rejects notifications.onBlocker=false from project config (hiding blockers)", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({
+          slack: { botToken: "xoxb", channel: "C" },
+          notifications: { enabled: true, onBlocker: true },
+        }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-hide-"));
+      try {
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({ notifications: { onBlocker: false } }),
+        );
+        const config = loadConfig(projectDir);
+        // onBlocker cannot be disabled by project — test failures/blockers
+        // are critical signals that a repo must not silence
+        expect(config.notifications.onBlocker).toBe(true);
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects notifications.onCompletion=false from project config", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({
+          slack: { botToken: "xoxb", channel: "C" },
+          notifications: { enabled: true, onCompletion: true },
+        }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-hide2-"));
+      try {
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({ notifications: { onCompletion: false } }),
+        );
+        const config = loadConfig(projectDir);
+        expect(config.notifications.onCompletion).toBe(true);
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
+    it("still allows notifications.onGitPush=false from project (legit noise control)", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({
+          slack: { botToken: "xoxb", channel: "C" },
+          notifications: { onGitPush: true },
+        }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-push-"));
+      try {
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({ notifications: { onGitPush: false } }),
+        );
+        const config = loadConfig(projectDir);
+        // onGitPush CAN be overridden — push-heavy repos legitimately want quieter output
+        expect(config.notifications.onGitPush).toBe(false);
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
     it("rejects notifications.dryRun=true from project config (stealth sabotage)", () => {
       writeFileSync(
         join(tempDir, "config.json"),

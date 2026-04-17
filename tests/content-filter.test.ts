@@ -240,6 +240,37 @@ describe("ContentFilter", () => {
         expect(result.summary, variant).toContain("[REDACTED]");
       }
     });
+
+    it("redacts Cyrillic homoglyph AKIA (АKIA)", () => {
+      // Cyrillic А (U+0410) looks identical to Latin A
+      const result = filter.filter(
+        makeUpdate({ summary: "key=АKIAIOSFODNN7EXAMPLE" }),
+      );
+      expect(result.summary).toContain("[REDACTED]");
+    });
+
+    it("redacts Greek homoglyph (Ρassword)", () => {
+      // Greek Ρ (U+03A1) looks like Latin P
+      const result = filter.filter(
+        makeUpdate({ summary: "Ρassword=hunter2abcdefg" }),
+      );
+      expect(result.summary).toContain("[REDACTED]");
+    });
+
+    it("redacts JSON-quoted secrets", () => {
+      const result = filter.filter(
+        makeUpdate({ summary: 'config: {"password":"hunter2abcdef","env":"prod"}' }),
+      );
+      expect(result.summary).toContain("[REDACTED]");
+      expect(result.summary).not.toContain("hunter2abcdef");
+    });
+
+    it("redacts YAML-quoted secrets", () => {
+      const result = filter.filter(
+        makeUpdate({ summary: "api_key: hunter2abcdef" }),
+      );
+      expect(result.summary).toContain("[REDACTED]");
+    });
   });
 
   describe("grapheme-safe truncation", () => {
