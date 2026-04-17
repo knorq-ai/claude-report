@@ -364,13 +364,16 @@ function clampRateLimit(raw: Record<string, unknown>): Record<string, unknown> {
   if (maxPerSession !== undefined) out.maxPerSession = maxPerSession;
   if (maxPerDay !== undefined) out.maxPerDay = maxPerDay;
   if (deduplicationWindowMs !== undefined) out.deduplicationWindowMs = deduplicationWindowMs;
-  // bypassTypes: only allow a known-safe subset (never let project config add
-  // "status" as a bypass which would let every status post skip rate limits)
-  if (Array.isArray(raw.bypassTypes)) {
-    const allowed = new Set(["blocker", "completion"]);
-    out.bypassTypes = raw.bypassTypes.filter(
-      (t) => typeof t === "string" && allowed.has(t),
-    );
+  // bypassTypes: project config cannot NARROW the default blocker/completion
+  // bypass (doing so would silence critical test-failure/completion alerts —
+  // the exact sabotage FORBIDDEN_NOTIF_KEYS prevents for notif toggles).
+  // It also cannot ADD unsafe types like "status" or "push".
+  // So: bypassTypes is simply NOT project-overridable — we drop it from the
+  // sanitized output entirely. The default rateLimit.bypassTypes from
+  // DEFAULT_CONFIG survives intact.
+  // (We reference raw.bypassTypes only to log when the attacker tried.)
+  if (raw.bypassTypes !== undefined) {
+    // Silently dropped — no value in logging every benign occurrence
   }
   return out;
 }

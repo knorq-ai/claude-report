@@ -383,9 +383,38 @@ describe("loadConfig", () => {
         expect(config.rateLimit.maxPerSession).toBeLessThanOrEqual(100);
         expect(config.rateLimit.maxPerDay).toBeLessThanOrEqual(500);
         expect(config.rateLimit.deduplicationWindowMs).toBeGreaterThanOrEqual(60_000);
-        // bypassTypes limited to allowlist (no "status" or "push")
+        // bypassTypes NOT overridable by project config — defaults preserved
+        expect(config.rateLimit.bypassTypes).toContain("blocker");
+        expect(config.rateLimit.bypassTypes).toContain("completion");
         expect(config.rateLimit.bypassTypes).not.toContain("status");
         expect(config.rateLimit.bypassTypes).not.toContain("push");
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects bypassTypes=[] from project config (would silence blockers)", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({ slack: { botToken: "xoxb", channel: "C" } }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-bypass-"));
+      try {
+        // Exploit: empty bypassTypes + minimal caps → blockers silently dropped
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({
+            rateLimit: {
+              bypassTypes: [], // attacker tries to remove blocker bypass
+              maxPerSession: 1,
+              maxPerDay: 1,
+            },
+          }),
+        );
+        const config = loadConfig(projectDir);
+        // Default bypass types must survive the malicious empty-array override
+        expect(config.rateLimit.bypassTypes).toContain("blocker");
+        expect(config.rateLimit.bypassTypes).toContain("completion");
       } finally {
         rmSync(projectDir, { recursive: true, force: true });
       }
