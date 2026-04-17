@@ -13,48 +13,57 @@ const MAX_DETAILS_LENGTH = 500;
  * - Ordering: most specific patterns first so they match before greedy
  *   fallbacks like the generic hex catch-all.
  */
-const SECRET_PATTERN_SOURCES: string[] = [
+/**
+ * Each secret pattern tagged with its required flags.
+ *
+ * Case-sensitive patterns (`"g"`): token formats with specific casing
+ * (`AKIA`, `ghp_`, `sk-`) where case is part of the literal identifier.
+ *
+ * Case-insensitive patterns (`"gi"`): named key-value forms where
+ * `password=`, `Password=`, `PASSWORD=` are all the same threat.
+ */
+interface SecretPattern {
+  source: string;
+  flags: string;
+}
+
+const SECRET_PATTERNS: SecretPattern[] = [
   // AWS
-  "AKIA[0-9A-Z]{16}",                                  // AWS access key id
+  { source: "AKIA[0-9A-Z]{16}", flags: "g" },
   // AWS secret (40-char base64). Require at least one non-hex character
   // ([G-Zg-z] or `/` `+`) to avoid matching 40-char git SHAs.
-  "(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]*[G-Zg-z/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])",
+  { source: "(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]*[G-Zg-z/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])", flags: "g" },
   // Slack
-  "xox[baprs]-[0-9A-Za-z-]{10,}",                      // Slack bot/user/app/refresh
+  { source: "xox[baprs]-[0-9A-Za-z-]{10,}", flags: "g" },
   // GitHub
-  "ghp_[A-Za-z0-9]{36,}",                              // classic PAT
-  "github_pat_[A-Za-z0-9_]{20,}",                      // fine-grained PAT
-  "gh[ousr]_[A-Za-z0-9]{20,}",                         // OAuth/User/Server/Refresh tokens
+  { source: "ghp_[A-Za-z0-9]{36,}", flags: "g" },
+  { source: "github_pat_[A-Za-z0-9_]{20,}", flags: "g" },
+  { source: "gh[ousr]_[A-Za-z0-9]{20,}", flags: "g" },
   // LLM providers
-  "sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}",              // OpenAI / Anthropic
-  "AIza[0-9A-Za-z_-]{35}",                             // Google API key
+  { source: "sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}", flags: "g" },
+  { source: "AIza[0-9A-Za-z_-]{35}", flags: "g" },
   // Stripe
-  "sk_(?:live|test)_[A-Za-z0-9]{20,}",
-  "rk_(?:live|test)_[A-Za-z0-9]{20,}",
+  { source: "sk_(?:live|test)_[A-Za-z0-9]{20,}", flags: "g" },
+  { source: "rk_(?:live|test)_[A-Za-z0-9]{20,}", flags: "g" },
   // NPM
-  "npm_[A-Za-z0-9]{36,}",
-  // JWT — match 2-part (incomplete) or 3-part forms.
-  // Bounded length (max 2048 per segment) prevents catastrophic backtracking.
-  "eyJ[A-Za-z0-9_-]{10,2048}\\.[A-Za-z0-9_-]{10,2048}(?:\\.[A-Za-z0-9_-]{10,2048})?",
-  // Private keys — match the header AND greedily consume the base64 body
-  // through the END footer so multi-line PEMs are fully redacted.
-  // Using [\\s\\S] because `.` doesn't match newlines and we need cross-line.
-  // Non-greedy body to avoid matching across multiple unrelated PEMs.
-  "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----[\\s\\S]{0,8192}?-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----",
-  // Bare PEM header (when footer is out of range or truncated)
-  "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----",
-  // Azure / cloud connection strings
-  "DefaultEndpointsProtocol=[^\\s\"']+AccountKey=[^\\s\"';]+",
-  // URL basic-auth (postgres://user:password@host, https://user:token@host, etc.)
-  // Captures the scheme://user:password@ prefix — redacts both user and pw.
-  "[a-zA-Z][a-zA-Z0-9+.-]*:\\/\\/[^:/?#\\s\"']+:[^@/?#\\s\"']+@",
-  // Bearer tokens in Authorization headers (covers anything sensitive after "Bearer ")
-  "[Bb]earer\\s+[A-Za-z0-9_\\-\\.=+/]{16,}",
-  // Generic key=value secrets (named). Added pw, pwd, credentials, session_key,
-  // private_key, client_secret, refresh_token, access_key.
-  "(?:password|passwd|pwd|pw|secret|token|credentials|api[_-]?key|auth[_-]?token|access[_-]?token|access[_-]?key|refresh[_-]?token|client[_-]?secret|session[_-]?key|private[_-]?key)\\s*[=:]\\s*[\"']?[^\\s\"'{}<>]+",
+  { source: "npm_[A-Za-z0-9]{36,}", flags: "g" },
+  // JWT — 2-part or 3-part; bounded {10,2048} per segment prevents backtracking.
+  { source: "eyJ[A-Za-z0-9_-]{10,2048}\\.[A-Za-z0-9_-]{10,2048}(?:\\.[A-Za-z0-9_-]{10,2048})?", flags: "g" },
+  // Private keys — three tiers to handle malformed/truncated PEMs.
+  { source: "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----[\\s\\S]{0,8192}?-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----", flags: "g" },
+  { source: "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----[\\s\\S]{0,8192}?-----END [A-Z0-9 ]+-----", flags: "g" },
+  { source: "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----(?:[ \\t]*\\n[A-Za-z0-9+/=\\s]{0,8192})?", flags: "g" },
+  // Azure / cloud connection strings (keyword case-insensitive)
+  { source: "DefaultEndpointsProtocol=[^\\s\"']+AccountKey=[^\\s\"';]+", flags: "gi" },
+  // URL basic-auth — redact entire URL (host/path reveals internal infra)
+  { source: "[a-zA-Z][a-zA-Z0-9+.-]*:\\/\\/[^:/?#\\s\"']+:[^@/?#\\s\"']+@[^\\s\"'<>]+", flags: "g" },
+  // Bearer tokens in Authorization headers
+  { source: "bearer\\s+[A-Za-z0-9_\\-\\.=+/]{16,}", flags: "gi" },
+  // Named key=value secrets — CASE INSENSITIVE because `Password=`, `PW=`,
+  // `ApiKey=` are all real in logs and must redact.
+  { source: "(?:password|passwd|pwd|pw|secret|token|credentials|api[_-]?key|auth[_-]?token|access[_-]?token|access[_-]?key|refresh[_-]?token|client[_-]?secret|session[_-]?key|private[_-]?key)\\s*[=:]\\s*[\"']?[^\\s\"'{}<>,;]+", flags: "gi" },
   // Long hex strings last (avoids eating git SHAs which are ≤40 hex)
-  "(?<![a-f0-9])[a-f0-9]{64,}(?![a-f0-9])",
+  { source: "(?<![a-f0-9])[a-f0-9]{64,}(?![a-f0-9])", flags: "g" },
 ];
 
 /**
@@ -63,7 +72,7 @@ const SECRET_PATTERN_SOURCES: string[] = [
  * would otherwise plague a module-level `/g` regex shared across callers.
  */
 function compilePatterns(): RegExp[] {
-  return SECRET_PATTERN_SOURCES.map((src) => new RegExp(src, "g"));
+  return SECRET_PATTERNS.map((p) => new RegExp(p.source, p.flags));
 }
 
 /**

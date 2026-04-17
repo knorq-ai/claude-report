@@ -368,7 +368,8 @@ async function main(): Promise<void> {
     logText += `\n  ${escapeSlackMrkdwn(filtered.details)}`;
   }
 
-  // Dry-run: log to disk, never hit Slack.
+  // Dry-run: log to disk, never hit Slack. Still update session state so dedup
+  // works consistently (switching dryRun on/off shouldn't suddenly allow dupes).
   if (config.notifications.dryRun) {
     try {
       const logDir = getLogDir();
@@ -381,6 +382,17 @@ async function main(): Promise<void> {
     } catch (err) {
       process.stderr.write(`[claude-report] dry-run write failed: ${err instanceof Error ? err.message : err}\n`);
     }
+    rateLimiter.recordPost(filtered);
+    const today = localDateStr();
+    updateSessionForProject(userId, "activity-log", {
+      lastPostAt: new Date().toISOString(),
+      lastPostSummary: filtered.summary,
+      postCount: session.postCount + 1,
+      dailyPostCount: session.dailyPostDate === today
+        ? session.dailyPostCount + 1
+        : 1,
+      dailyPostDate: today,
+    });
     return;
   }
 
@@ -418,10 +430,13 @@ async function main(): Promise<void> {
     }
 
     // Success: record for rate-limiter dedup and update session counters.
+    // lastPostSummary is persisted so the next hook subprocess can also dedup
+    // (in-memory dedup cache is useless in short-lived hook processes).
     rateLimiter.recordPost(filtered);
 
     updateSessionForProject(userId, "activity-log", {
       lastPostAt: new Date().toISOString(),
+      lastPostSummary: filtered.summary,
       postCount: session.postCount + 1,
       dailyPostCount: session.dailyPostDate === today
         ? session.dailyPostCount + 1

@@ -6,21 +6,24 @@ export interface RateLimitResult {
   reason?: string;
 }
 
-/** Bounded LRU-ish cache entries for per-user dedup. */
+/** Bounded LRU-ish cache entries for per-user dedup in long-lived processes. */
 const MAX_DEDUP_ENTRIES = 100;
 
 /**
- * Rate limiter with:
- * - Minimum interval between posts (uses persisted session.lastPostAt for cross-process accuracy)
- * - Per-session cap
- * - Per-day cap
- * - In-process deduplication keyed by userId (prevents cross-user dedup in MCP server)
+ * Rate limiter. All state either:
+ *   - comes from the persisted `Session` (cross-process: threadId, postCount,
+ *     dailyPostCount, lastPostAt, muted, lastPostSummary)
+ *   - or is held in-memory on this instance (only meaningful in long-lived
+ *     processes like the MCP server)
+ *
+ * This means the short-lived hook subprocess gets dedup too, because dedup
+ * reads `session.lastPostSummary` + `session.lastPostAt` (both persisted).
  *
  * Mute always wins — even bypassTypes honor the mute. `bypassTypes` only
- * exempts from interval/session/daily caps, not from mute.
+ * exempts from interval/session/daily caps, not from mute or dedup.
  */
 export class RateLimiter {
-  /** userId → last summary + timestamp. Bounded to prevent unbounded growth. */
+  /** userId → last summary + timestamp. In-memory, bounded. Only useful in MCP server. */
   private lastPostByUser = new Map<string, { time: number; summary: string }>();
 
   constructor(private config: RateLimitConfig) {}
@@ -66,13 +69,26 @@ export class RateLimiter {
     }
 
     // Deduplication — always applied, including bypass types (prevents blocker spam loops).
-    // Keyed by userId so concurrent sessions from different users don't shadow each other.
+    // Source the comparison pair from the most recent signal available:
+    //   - in-memory (MCP server, this same process) takes precedence
+    //   - falls back to persisted session fields (works for short-lived hooks)
     const userKey = update.userId || "unknown";
-    const last = this.lastPostByUser.get(userKey);
-    if (last) {
-      const elapsed = Date.now() - last.time;
+    const memory = this.lastPostByUser.get(userKey);
+    let lastSummary: string | null = null;
+    let lastTime: number | null = null;
+
+    if (memory) {
+      lastSummary = memory.summary;
+      lastTime = memory.time;
+    } else if (session.lastPostSummary && session.lastPostAt) {
+      lastSummary = session.lastPostSummary;
+      lastTime = new Date(session.lastPostAt).getTime();
+    }
+
+    if (lastSummary !== null && lastTime !== null) {
+      const elapsed = Date.now() - lastTime;
       if (elapsed < this.config.deduplicationWindowMs) {
-        const similarity = tokenSimilarity(last.summary, update.summary);
+        const similarity = tokenSimilarity(lastSummary, update.summary);
         if (similarity > 0.8) {
           return {
             allowed: false,

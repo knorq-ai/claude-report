@@ -103,19 +103,25 @@ describe("loadConfig", () => {
     expect(config.slack.channel).toBe("C-file");
   });
 
-  it("loads project config that overrides user config", () => {
+  it("project config can only override notifications/rateLimit (slack.* stripped)", () => {
     writeFileSync(
       join(tempDir, "config.json"),
-      JSON.stringify({ slack: { botToken: "xoxb-user", channel: "C-user" } }),
+      JSON.stringify({
+        slack: { botToken: "xoxb-user", channel: "C-user" },
+        notifications: { enabled: true, onGitPush: true },
+      }),
     );
     const projectDir = mkdtempSync(join(tmpdir(), "claude-report-project-"));
     writeFileSync(
       join(projectDir, ".claude-report.json"),
-      JSON.stringify({ slack: { channel: "C-project" } }),
+      JSON.stringify({
+        slack: { channel: "C-project" }, // MUST be stripped
+        notifications: { onGitPush: false }, // MUST be honored
+      }),
     );
     const config = loadConfig(projectDir);
-    expect(config.slack.botToken).toBe("xoxb-user");
-    expect(config.slack.channel).toBe("C-project");
+    expect(config.slack.channel).toBe("C-user"); // unchanged
+    expect(config.notifications.onGitPush).toBe(false); // overridden
     rmSync(projectDir, { recursive: true, force: true });
   });
 
@@ -195,22 +201,50 @@ describe("loadConfig", () => {
       }
     });
 
-    it("still allows safe project config: slack.channel and slack.mentionOnBlocker", () => {
+    it("strips slack.channel from project config (prevents thread-hijack)", () => {
       writeFileSync(
         join(tempDir, "config.json"),
         JSON.stringify({ slack: { botToken: "xoxb", channel: "C-default" } }),
       );
       const projectDir = mkdtempSync(join(tmpdir(), "claude-report-safe-"));
       try {
+        // Malicious project tries to redirect posts to attacker channel
         writeFileSync(
           join(projectDir, ".claude-report.json"),
           JSON.stringify({
-            slack: { channel: "C-project-specific", mentionOnBlocker: "@oncall" },
+            slack: { channel: "C-ATTACKER", mentionOnBlocker: "<@UATTACKER>" },
           }),
         );
         const config = loadConfig(projectDir);
-        expect(config.slack.channel).toBe("C-project-specific");
-        expect(config.slack.mentionOnBlocker).toBe("@oncall");
+        // User's real channel unchanged — project config cannot redirect posts
+        expect(config.slack.channel).toBe("C-default");
+        expect(config.slack.mentionOnBlocker).toBeUndefined();
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
+    it("allows project config to override notifications and rateLimit", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({
+          slack: { botToken: "xoxb", channel: "C" },
+          notifications: { enabled: true, onGitPush: true, onBlocker: true },
+        }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-safe-"));
+      try {
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({
+            notifications: { onGitPush: false },
+            rateLimit: { minIntervalMs: 60_000 },
+          }),
+        );
+        const config = loadConfig(projectDir);
+        expect(config.notifications.onGitPush).toBe(false);
+        expect(config.notifications.onBlocker).toBe(true); // from user config
+        expect(config.rateLimit.minIntervalMs).toBe(60_000);
       } finally {
         rmSync(projectDir, { recursive: true, force: true });
       }

@@ -49,6 +49,12 @@ export interface Session {
   dailyPostCount: number;
   dailyPostDate: string;
   muted: boolean;
+  /**
+   * Last posted summary + time, for dedup across processes. Persisted so the
+   * hook path (short-lived subprocess per invocation) can enforce the
+   * deduplication window, not just the in-memory MCP server.
+   */
+  lastPostSummary?: string;
 }
 
 /** Interface for posting status updates */

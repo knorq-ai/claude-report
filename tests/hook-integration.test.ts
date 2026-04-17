@@ -260,4 +260,119 @@ describe("PostToolUse hook — integration", () => {
     expect(code).toBe(0);
     expect(existsSync(join(tempDir, "logs", "dry-run.log"))).toBe(false);
   });
+
+  it("concurrent hooks all exit cleanly and session state is consistent", async () => {
+    writeFileSync(
+      join(tempDir, "config.json"),
+      JSON.stringify({
+        slack: { botToken: "xoxb-test", channel: "C-test" },
+        user: { name: "TestUser", slackUserId: "U-concurrent" },
+        notifications: { dryRun: true },
+        rateLimit: {
+          minIntervalMs: 0, // disable interval gate for this test
+          maxPerSession: 100,
+          maxPerDay: 100,
+          deduplicationWindowMs: 0, // disable dedup so all events post
+          bypassTypes: [],
+        },
+      }),
+    );
+
+    // Launch 4 hooks in parallel with DIFFERENT branches so dedup doesn't fire.
+    const hooks = ["main", "dev", "feature-a", "feature-b"].map((branch) =>
+      runHook(
+        hookInputBash(
+          `git push origin ${branch}`,
+          `To github.com:user/repo.git\n   abc..def  ${branch} -> ${branch}`,
+        ),
+        env(),
+      ),
+    );
+    const results = await Promise.all(hooks);
+
+    // Critical: all must exit cleanly. No crashes, no lock timeouts.
+    for (const r of results) expect(r.code).toBe(0);
+
+    // All 4 distinct pushes should land in the dry-run log (no dedup since
+    // different branches = different summaries).
+    const logContent = readFileSync(join(tempDir, "logs", "dry-run.log"), "utf-8");
+    for (const branch of ["main", "dev", "feature-a", "feature-b"]) {
+      expect(logContent).toContain(`Pushed to ${branch}`);
+    }
+
+    // Session file must be well-formed (not corrupted by concurrent writes).
+    const { readdirSync } = await import("node:fs");
+    const stateFiles = readdirSync(join(tempDir, "state"));
+    const sessionPath = join(
+      tempDir,
+      "state",
+      stateFiles.find((f) => f.startsWith("session-"))!,
+    );
+    const session = JSON.parse(readFileSync(sessionPath, "utf-8"));
+    expect(session.postCount).toBeGreaterThanOrEqual(1);
+    // postCount should be at MOST 4 (one per hook) — never exceed, never go negative
+    expect(session.postCount).toBeLessThanOrEqual(4);
+  });
+
+  it("dedup uses persisted session.lastPostSummary (cross-process)", async () => {
+    writeFileSync(
+      join(tempDir, "config.json"),
+      JSON.stringify({
+        slack: { botToken: "xoxb-test", channel: "C-test" },
+        user: { name: "TestUser", slackUserId: "U-dedup" },
+        notifications: { dryRun: true },
+        rateLimit: {
+          minIntervalMs: 0,
+          maxPerSession: 100,
+          maxPerDay: 100,
+          deduplicationWindowMs: 300_000, // 5 min
+          bypassTypes: [],
+        },
+      }),
+    );
+
+    // First hook: writes lastPostSummary to session file.
+    await runHook(
+      hookInputBash("git push origin main", "To x:y/z.git\n   a..b  main -> main"),
+      env(),
+    );
+
+    // Second hook: identical summary — SHOULD be deduped via persisted session.
+    await runHook(
+      hookInputBash("git push origin main", "To x:y/z.git\n   c..d  main -> main"),
+      env(),
+    );
+
+    const logContent = readFileSync(join(tempDir, "logs", "dry-run.log"), "utf-8");
+    const pushCount = (logContent.match(/Pushed to main/g) || []).length;
+    // Exactly ONE push should reach the log — the second was deduped
+    expect(pushCount).toBe(1);
+  });
+
+  it("persists lastPostSummary for cross-process dedup", async () => {
+    writeFileSync(
+      join(tempDir, "config.json"),
+      JSON.stringify({
+        slack: { botToken: "xoxb-test", channel: "C-test" },
+        user: { name: "TestUser", slackUserId: "U-dedup" },
+        notifications: { dryRun: true },
+      }),
+    );
+
+    // First hook: pushes to main, writes lastPostSummary
+    const first = await runHook(
+      hookInputBash("git push origin main", "To github.com:u/r.git\n   abc..def  main -> main"),
+      env(),
+    );
+    expect(first.code).toBe(0);
+
+    // Read session file — should contain lastPostSummary
+    const { readdirSync } = await import("node:fs");
+    const stateFiles = readdirSync(join(tempDir, "state"));
+    expect(stateFiles.some((f) => f.startsWith("session-"))).toBe(true);
+    const sessionPath = join(tempDir, "state", stateFiles.find((f) => f.startsWith("session-"))!);
+    const session = JSON.parse(readFileSync(sessionPath, "utf-8"));
+    expect(session.lastPostSummary).toContain("Pushed to main");
+    expect(session.lastPostAt).toBeTruthy();
+  });
 });

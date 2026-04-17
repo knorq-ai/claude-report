@@ -275,22 +275,28 @@ function loadAndMerge(
 
   let data = result.data as Record<string, unknown>;
   if (source === "project") {
-    // Strip fields that an untrusted repo must not control.
-    // - `user.*`: would allow hijacking another user's Slack thread by setting
-    //   `slackUserId` to the victim's id.
-    // - `relay.*` / `slack.botToken`: would allow redirecting posts to an
-    //   attacker-controlled endpoint or exfiltrating data.
-    const { user, relay, slack, ...safe } = data;
-    if (user || relay || (slack && typeof slack === "object" && "botToken" in (slack as object))) {
-      console.error(
-        `[claude-report] Ignoring unsafe fields (user/relay/slack.botToken) from project config at ${filePath}`,
-      );
+    // Project-level config is UNTRUSTED (a malicious repo can ship it).
+    // Strip ALL fields that could redirect posts, exfiltrate data, or hijack
+    // identity. `slack.channel` looks like a "routing hint" but a hostile repo
+    // can point posts at the attacker's channel and silently exfiltrate dev
+    // activity — so even the channel is not allowed at project scope.
+    //
+    // Whitelist approach: project config can ONLY influence notification
+    // toggles and rate-limit tuning. Everything else is ignored with a log.
+    const ALLOWED_PROJECT_KEYS = new Set(["notifications", "rateLimit"]);
+    const stripped: string[] = [];
+    const safe: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (ALLOWED_PROJECT_KEYS.has(key)) {
+        safe[key] = value;
+      } else {
+        stripped.push(key);
+      }
     }
-    // Allow slack.channel / slack.mentionOnBlocker at project scope (these are
-    // routing hints, not credentials).
-    if (slack && typeof slack === "object") {
-      const { botToken, ...safeSlack } = slack as Record<string, unknown>;
-      if (Object.keys(safeSlack).length > 0) safe.slack = safeSlack;
+    if (stripped.length > 0) {
+      console.error(
+        `[claude-report] Ignoring project-config fields (${stripped.join(", ")}) at ${filePath} — only notifications/rateLimit are honored at project scope.`,
+      );
     }
     data = safe;
   }
