@@ -1,12 +1,23 @@
 import type { StatusUpdate } from "./types.js";
 
-/** Escape Slack mrkdwn special characters to prevent injection */
+/**
+ * Escape Slack mrkdwn special characters to prevent injection.
+ *
+ * Defends against:
+ * - `<url|label>` / `<!channel>` / `<!here>` / `<!everyone>` broadcast control sequences
+ *   (escaped via &lt; / &gt; — Slack does not parse entity-escaped angle brackets)
+ * - `@channel` / `@here` / `@everyone` raw mentions (Slack auto-links in some contexts;
+ *   we insert a zero-width space to neutralize)
+ * - `*bold*`, `_italic_`, `~strike~`, `` `code` `` formatting injection
+ */
 export function escapeSlackMrkdwn(text: string): string {
-  // HTML entities (required by Slack mrkdwn)
+  // HTML entities — critical: &lt; defuses <!channel>, <!here>, <!everyone>, <@UID>
   let escaped = text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+  // Neutralize @channel / @here / @everyone that Slack's parser might still auto-link
+  escaped = escaped.replace(/@(channel|here|everyone)\b/gi, "@\u200B$1");
   // Neutralize mrkdwn formatting by inserting zero-width space before trigger chars
   escaped = escaped.replace(/([*_~`])/g, "\u200B$1");
   return escaped;

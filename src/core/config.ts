@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import { z } from "zod";
 
 export interface RateLimitConfig {
   minIntervalMs: number;
@@ -37,6 +38,42 @@ export interface Config {
   };
 }
 
+/**
+ * Partial Config schema for user-supplied JSON files. All fields optional —
+ * deepMerge fills in missing fields from DEFAULT_CONFIG. Rejects malformed
+ * types (e.g., `minIntervalMs: "hello"`) rather than silently poisoning runtime.
+ */
+const PartialConfigSchema = z.object({
+  slack: z.object({
+    botToken: z.string().optional(),
+    channel: z.string().optional(),
+    mentionOnBlocker: z.string().optional(),
+  }).partial().optional(),
+  relay: z.object({
+    url: z.string().url(),
+    teamId: z.string(),
+  }).optional(),
+  notifications: z.object({
+    enabled: z.boolean().optional(),
+    onGitPush: z.boolean().optional(),
+    onBlocker: z.boolean().optional(),
+    onCompletion: z.boolean().optional(),
+    verbosity: z.enum(["minimal", "normal", "verbose"]).optional(),
+    dryRun: z.boolean().optional(),
+  }).partial().optional(),
+  rateLimit: z.object({
+    minIntervalMs: z.number().int().nonnegative(),
+    maxPerSession: z.number().int().nonnegative(),
+    maxPerDay: z.number().int().nonnegative(),
+    deduplicationWindowMs: z.number().int().nonnegative(),
+    bypassTypes: z.array(z.string()),
+  }).partial().optional(),
+  user: z.object({
+    name: z.string().optional(),
+    slackUserId: z.string().optional(),
+  }).partial().optional(),
+}).strict();
+
 const DEFAULT_CONFIG: Config = {
   slack: {
     botToken: "",
@@ -66,6 +103,7 @@ const DEFAULT_CONFIG: Config = {
 /**
  * Data directory — uses CLAUDE_PLUGIN_DATA if running as a plugin,
  * falls back to ~/.claude-report for standalone CLI usage.
+ * NOTE: State (sessions) intentionally diverges — see getStateDir().
  */
 export function getDataDir(): string {
   return process.env.CLAUDE_REPORT_DATA_DIR
@@ -73,9 +111,17 @@ export function getDataDir(): string {
     || join(homedir(), ".claude-report");
 }
 
-/** State directory (sessions, watermarks) */
+/**
+ * State directory (sessions, watermarks).
+ * Always uses ~/.claude-report/state/ regardless of CLAUDE_PLUGIN_DATA,
+ * because sessions map to Slack threads which are user-scoped shared state.
+ * Using the plugin data dir would create duplicate daily threads when the
+ * hook runs from different contexts (plugin vs settings.json vs CLI).
+ */
 export function getStateDir(): string {
-  return join(getDataDir(), "state");
+  const explicit = process.env.CLAUDE_REPORT_DATA_DIR;
+  if (explicit) return join(explicit, "state");
+  return join(homedir(), ".claude-report", "state");
 }
 
 /** Log directory */
@@ -105,30 +151,16 @@ export function isProjectDisabled(projectDir: string): boolean {
 export function loadConfig(projectDir?: string): Config {
   const config = structuredClone(DEFAULT_CONFIG);
 
-  // Layer 1: User-level config file (standalone CLI mode)
+  // Layer 1: User-level config file (standalone CLI mode) — trusted
   const userConfigPath = join(getConfigDir(), "config.json");
-  if (existsSync(userConfigPath)) {
-    try {
-      const userConfig = JSON.parse(readFileSync(userConfigPath, "utf-8"));
-      deepMerge(config, userConfig);
-    } catch (err) {
-      console.error(`[claude-report] Failed to parse ${userConfigPath}: ${err instanceof Error ? err.message : err}`);
-    }
-  }
+  loadAndMerge(config, userConfigPath, "user");
 
-  // Layer 2: Project-level config
+  // Layer 2: Project-level config — UNTRUSTED. A malicious repo could ship a
+  // .claude-report.json that redirects posts or hijacks threads. Credentials
+  // and user identity are stripped before merge.
   if (projectDir) {
     const projectConfigPath = join(projectDir, ".claude-report.json");
-    if (existsSync(projectConfigPath)) {
-      try {
-        const projectConfig = JSON.parse(
-          readFileSync(projectConfigPath, "utf-8"),
-        );
-        deepMerge(config, projectConfig);
-      } catch (err) {
-        console.error(`[claude-report] Failed to parse ${projectConfigPath}: ${err instanceof Error ? err.message : err}`);
-      }
-    }
+    loadAndMerge(config, projectConfigPath, "project");
   }
 
   // Layer 3: Environment variables — plugin userConfig + direct env vars (highest priority)
@@ -214,19 +246,90 @@ function deriveUserId(): string {
     .slice(0, 12);
 }
 
-function deepMerge(target: Record<string, any>, source: Record<string, any>): void {
+/**
+ * Load a JSON config file, validate via zod schema, and deepMerge into target.
+ *
+ * @param source  "user" = per-user config (trusted); "project" = project-level
+ *                config (untrusted — a malicious repo could ship a .claude-report.json).
+ *                Project-level configs cannot set user identity fields or relay
+ *                credentials, which would otherwise enable thread hijacking.
+ */
+function loadAndMerge(
+  target: Config,
+  filePath: string,
+  source: "user" | "project",
+): void {
+  if (!existsSync(filePath)) return;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(filePath, "utf-8"));
+  } catch (err) {
+    console.error(`[claude-report] Failed to parse ${filePath}: ${err instanceof Error ? err.message : err}`);
+    return;
+  }
+  const result = PartialConfigSchema.safeParse(raw);
+  if (!result.success) {
+    console.error(`[claude-report] Invalid config at ${filePath}: ${result.error.message}`);
+    return;
+  }
+
+  let data = result.data as Record<string, unknown>;
+  if (source === "project") {
+    // Strip fields that an untrusted repo must not control.
+    // - `user.*`: would allow hijacking another user's Slack thread by setting
+    //   `slackUserId` to the victim's id.
+    // - `relay.*` / `slack.botToken`: would allow redirecting posts to an
+    //   attacker-controlled endpoint or exfiltrating data.
+    const { user, relay, slack, ...safe } = data;
+    if (user || relay || (slack && typeof slack === "object" && "botToken" in (slack as object))) {
+      console.error(
+        `[claude-report] Ignoring unsafe fields (user/relay/slack.botToken) from project config at ${filePath}`,
+      );
+    }
+    // Allow slack.channel / slack.mentionOnBlocker at project scope (these are
+    // routing hints, not credentials).
+    if (slack && typeof slack === "object") {
+      const { botToken, ...safeSlack } = slack as Record<string, unknown>;
+      if (Object.keys(safeSlack).length > 0) safe.slack = safeSlack;
+    }
+    data = safe;
+  }
+
+  deepMerge(
+    target as unknown as Record<string, unknown>,
+    data,
+  );
+}
+
+const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function deepMerge(
+  target: Record<string, unknown>,
+  source: Record<string, unknown>,
+): void {
   for (const key of Object.keys(source)) {
-    if (key === "__proto__" || key === "constructor" || key === "prototype") continue;
+    // Prototype pollution guard: reject dangerous keys at every depth.
+    if (FORBIDDEN_KEYS.has(key)) continue;
+    // Only merge own properties (defense in depth; Object.keys already filters inherited).
+    if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+
+    const srcVal = source[key];
+    const tgtVal = target[key];
+
     if (
-      source[key] &&
-      typeof source[key] === "object" &&
-      !Array.isArray(source[key]) &&
-      target[key] &&
-      typeof target[key] === "object"
+      srcVal &&
+      typeof srcVal === "object" &&
+      !Array.isArray(srcVal) &&
+      tgtVal &&
+      typeof tgtVal === "object" &&
+      !Array.isArray(tgtVal)
     ) {
-      deepMerge(target[key], source[key]);
+      deepMerge(
+        tgtVal as Record<string, unknown>,
+        srcVal as Record<string, unknown>,
+      );
     } else {
-      target[key] = source[key];
+      target[key] = srcVal;
     }
   }
 }

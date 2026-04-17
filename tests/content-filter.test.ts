@@ -118,5 +118,95 @@ describe("ContentFilter", () => {
     it("returns false for clean text", () => {
       expect(filter.containsSecrets("normal text")).toBe(false);
     });
+
+    it("is safe under concurrent calls (no lastIndex mutation race)", () => {
+      // Run 100 overlapping containsSecrets calls — if /g-flag state were
+      // shared, results would alternate true/false. They must be consistent.
+      const results = Array.from({ length: 100 }, (_, i) =>
+        filter.containsSecrets(
+          i % 2 === 0 ? "AKIAIOSFODNN7EXAMPLE" : "plain text",
+        ),
+      );
+      for (let i = 0; i < 100; i++) {
+        expect(results[i]).toBe(i % 2 === 0);
+      }
+    });
+  });
+
+  describe("extended secret patterns", () => {
+    it("redacts GitHub fine-grained PAT (github_pat_*)", () => {
+      const result = filter.filter(
+        makeUpdate({ summary: "Using github_pat_11ABCDEFGHIJKLMNOPQRST_abcdef123456" }),
+      );
+      expect(result.summary).not.toContain("github_pat_");
+      expect(result.summary).toContain("[REDACTED]");
+    });
+
+    it("redacts GitHub app tokens (ghs_, ghu_, gho_, ghr_)", () => {
+      for (const prefix of ["ghs_", "ghu_", "gho_", "ghr_"]) {
+        const result = filter.filter(
+          makeUpdate({ summary: `Token: ${prefix}ABCDEFGHIJKLMNOPQRSTUV` }),
+        );
+        expect(result.summary, `prefix=${prefix}`).toContain("[REDACTED]");
+      }
+    });
+
+    it("redacts Google API keys (AIza...)", () => {
+      const key = "AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI";
+      const result = filter.filter(makeUpdate({ summary: `key=${key}` }));
+      expect(result.summary).not.toContain(key);
+    });
+
+    it("redacts npm tokens", () => {
+      const result = filter.filter(
+        makeUpdate({ summary: "NPM_TOKEN=npm_abcdefghijklmnopqrstuvwxyz0123456789" }),
+      );
+      expect(result.summary).not.toContain("npm_abcdefghij");
+    });
+
+    it("redacts Bearer tokens in Authorization headers", () => {
+      const result = filter.filter(
+        makeUpdate({ summary: "curl -H 'Authorization: Bearer abc123DEF456ghi789JKL' api.com" }),
+      );
+      expect(result.summary).toContain("[REDACTED]");
+      expect(result.summary).not.toContain("abc123DEF456ghi789JKL");
+    });
+
+    it("redacts private key headers", () => {
+      const result = filter.filter(
+        makeUpdate({ summary: "Key: -----BEGIN RSA PRIVATE KEY-----" }),
+      );
+      expect(result.summary).toContain("[REDACTED]");
+    });
+
+    it("does NOT false-positive on git SHAs (40 hex)", () => {
+      // 40-char hex = git SHA; should NOT be redacted (only 64+ hex is)
+      const result = filter.filter(
+        makeUpdate({ summary: "commit a1b2c3d4e5f60718293a4b5c6d7e8f901234abcd applied" }),
+      );
+      expect(result.summary).toContain("a1b2c3d4e5f60718293a4b5c6d7e8f901234abcd");
+    });
+
+    it("does NOT false-positive on benign words containing 'password'", () => {
+      const result = filter.filter(
+        makeUpdate({ summary: "Working on password reset flow" }),
+      );
+      // "password reset" doesn't match "password = value" pattern
+      expect(result.summary).toContain("password reset");
+    });
+  });
+
+  describe("grapheme-safe truncation", () => {
+    it("does not corrupt emoji across truncation boundary", () => {
+      // 50 grinning-face emoji = 100 UTF-16 code units, 50 code points
+      const emoji = "\u{1F600}".repeat(50);
+      const padding = "x".repeat(200);
+      const result = filter.filter(makeUpdate({ summary: padding + emoji }));
+      // The result should not contain lone surrogates (which render as "?" or "")
+      for (const ch of result.summary) {
+        const code = ch.codePointAt(0)!;
+        expect(code < 0xd800 || code > 0xdfff).toBe(true);
+      }
+    });
   });
 });

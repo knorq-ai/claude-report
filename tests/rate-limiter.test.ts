@@ -136,6 +136,52 @@ describe("RateLimiter", () => {
     );
     expect(result.allowed).toBe(true);
   });
+
+  it("mute beats bypassTypes — muted users cannot post blockers either", () => {
+    const session = makeSession({ muted: true });
+    const result = limiter.shouldPost(
+      makeUpdate({ type: "blocker" }),
+      session,
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("muted");
+  });
+
+  it("dedup applies even to bypassTypes (prevents blocker spam loops)", () => {
+    const dedupLimiter = new RateLimiter({
+      minIntervalMs: 60_000,
+      maxPerSession: 10,
+      maxPerDay: 30,
+      deduplicationWindowMs: 900_000,
+      bypassTypes: ["blocker", "completion"],
+    });
+    const first = makeUpdate({ type: "blocker", summary: "CI is down" });
+    dedupLimiter.recordPost(first);
+    const dup = makeUpdate({ type: "blocker", summary: "CI is down" });
+    const result = dedupLimiter.shouldPost(dup, makeSession());
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("Duplicate");
+  });
+
+  it("dedup is keyed per-user (user A's post does not shadow user B)", () => {
+    const dedupLimiter = new RateLimiter({
+      minIntervalMs: 0, // allow rapid posts for this test
+      maxPerSession: 100,
+      maxPerDay: 100,
+      deduplicationWindowMs: 900_000,
+      bypassTypes: [],
+    });
+    const userA = makeUpdate({ userId: "U-alice", summary: "same summary" });
+    dedupLimiter.recordPost(userA);
+    const userB = makeUpdate({
+      userId: "U-bob",
+      sessionId: "sess-bob",
+      summary: "same summary",
+    });
+    // Different user ID — should NOT dedup
+    const result = dedupLimiter.shouldPost(userB, makeSession({ userId: "U-bob" }));
+    expect(result.allowed).toBe(true);
+  });
 });
 
 describe("tokenSimilarity", () => {

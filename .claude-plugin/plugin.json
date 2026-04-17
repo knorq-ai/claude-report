@@ -7,6 +7,39 @@
   },
   "license": "MIT",
   "keywords": ["slack", "status", "team", "reporting", "mcp"],
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hooks/post-tool-use.js"
+          }
+        ]
+      },
+      {
+        "matcher": "TaskUpdate",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hooks/post-tool-use.js"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hooks/user-prompt-submit.js"
+          }
+        ]
+      }
+    ]
+  },
   "userConfig": {
     "slack_bot_token": {
       "title": "Slack Bot Token",

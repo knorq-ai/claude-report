@@ -5,6 +5,8 @@
 import { describe, it, expect } from "vitest";
 import {
   detectBashEvent,
+  detectTaskEvent,
+  getToolOutput,
   parseTaskOutput,
 } from "../src/hooks/post-tool-use.js";
 
@@ -60,13 +62,14 @@ describe("detectBashEvent", () => {
       expect(result!.metadata!.branch).toBe("develop");
     });
 
-    it("extracts branch from refspec with colon", () => {
+    it("extracts resolved branch name from output (prefers output over command)", () => {
       const result = detectBashEvent(
         "git push origin HEAD:refs/heads/feature",
         "To github.com:user/repo.git\n   abc..def  HEAD -> feature",
       );
-      // split(":").pop() returns the full ref after the colon
-      expect(result!.metadata!.branch).toBe("refs/heads/feature");
+      // Output's "HEAD -> feature" is the resolved destination branch name,
+      // which is more user-friendly than the raw refspec.
+      expect(result!.metadata!.branch).toBe("feature");
     });
 
     it("falls back to output parsing when no command args", () => {
@@ -258,5 +261,162 @@ describe("parseTaskOutput", () => {
     const result = parseTaskOutput(JSON.stringify({ other: "field" }));
     expect(result.subject).toBeUndefined();
     expect(result.description).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getToolOutput
+// ---------------------------------------------------------------------------
+
+describe("getToolOutput", () => {
+  it("returns tool_output string when present", () => {
+    const result = getToolOutput({
+      tool_name: "Bash",
+      tool_input: {},
+      tool_output: "hello world",
+    });
+    expect(result).toBe("hello world");
+  });
+
+  it("returns tool_response string when tool_output is absent", () => {
+    const result = getToolOutput({
+      tool_name: "Bash",
+      tool_input: {},
+      tool_response: "from response",
+    });
+    expect(result).toBe("from response");
+  });
+
+  it("extracts stdout from structured tool_response object", () => {
+    const result = getToolOutput({
+      tool_name: "Bash",
+      tool_input: {},
+      tool_response: {
+        stdout: "[main abc1234] test\nTo github.com:user/repo.git\n   abc..def  main -> main",
+        stderr: "",
+        interrupted: false,
+      },
+    });
+    expect(result).toContain("[main abc1234]");
+    expect(result).toContain("To github.com");
+  });
+
+  it("falls back to stderr when stdout is empty", () => {
+    const result = getToolOutput({
+      tool_name: "Bash",
+      tool_input: {},
+      tool_response: {
+        stdout: "",
+        stderr: "To github.com:user/repo.git\n   abc..def  main -> main",
+      },
+    });
+    expect(result).toContain("To github.com");
+  });
+
+  it("concatenates stdout and stderr when both present", () => {
+    const result = getToolOutput({
+      tool_name: "Bash",
+      tool_input: {},
+      tool_response: {
+        stdout: "[main abc] commit msg",
+        stderr: "To github.com:user/repo.git",
+      },
+    });
+    expect(result).toContain("[main abc] commit msg");
+    expect(result).toContain("To github.com");
+  });
+
+  it("returns empty string when stdout is missing from object", () => {
+    const result = getToolOutput({
+      tool_name: "Bash",
+      tool_input: {},
+      tool_response: { interrupted: false },
+    });
+    expect(result).toBe("");
+  });
+
+  it("returns empty string when stdout is null", () => {
+    const result = getToolOutput({
+      tool_name: "Bash",
+      tool_input: {},
+      tool_response: { stdout: null, stderr: "" } as any,
+    });
+    expect(result).toBe("");
+  });
+
+  it("returns empty string when both fields are absent", () => {
+    const result = getToolOutput({
+      tool_name: "Bash",
+      tool_input: {},
+    });
+    expect(result).toBe("");
+  });
+
+  it("prefers tool_output over tool_response", () => {
+    const result = getToolOutput({
+      tool_name: "Bash",
+      tool_input: {},
+      tool_output: "from output",
+      tool_response: { stdout: "from response" },
+    });
+    expect(result).toBe("from output");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectTaskEvent
+// ---------------------------------------------------------------------------
+
+describe("detectTaskEvent", () => {
+  it("extracts subject from structured tool_response", () => {
+    const result = detectTaskEvent(
+      { taskId: "7", status: "completed" },
+      "",
+      { taskId: "7", status: "completed", subject: "Implement auth middleware" },
+    );
+    expect(result).not.toBeNull();
+    expect(result!.summary).toBe("Task completed: Implement auth middleware");
+  });
+
+  it("prefers tool_input.subject over rawResponse", () => {
+    const result = detectTaskEvent(
+      { taskId: "7", status: "completed", subject: "From input" },
+      "",
+      { subject: "From response" },
+    );
+    expect(result!.summary).toBe("Task completed: From input");
+  });
+
+  it("falls back to parsed output subject", () => {
+    const result = detectTaskEvent(
+      { taskId: "7", status: "completed" },
+      JSON.stringify({ subject: "From output" }),
+    );
+    expect(result!.summary).toBe("Task completed: From output");
+  });
+
+  it("falls back to task ID when no subject available", () => {
+    const result = detectTaskEvent(
+      { taskId: "7", status: "completed" },
+      "",
+    );
+    expect(result!.summary).toBe("Task completed: #7");
+  });
+
+  it("returns null for non-completed tasks", () => {
+    const result = detectTaskEvent(
+      { taskId: "7", status: "in_progress" },
+      "",
+    );
+    expect(result).toBeNull();
+  });
+
+  it("extracts description from structured response", () => {
+    const result = detectTaskEvent(
+      { taskId: "7", status: "completed" },
+      "",
+      { subject: "Auth", description: "Added JWT middleware" },
+    );
+    expect(result!.details).toBe("Added JWT middleware");
   });
 });

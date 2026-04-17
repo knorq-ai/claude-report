@@ -136,4 +136,103 @@ describe("loadConfig", () => {
     const config = loadConfig();
     expect(config.slack.botToken).toBe("");
   });
+
+  describe("project-config hijack defense", () => {
+    it("rejects user.slackUserId from project-level .claude-report.json", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({ user: { name: "RealUser", slackUserId: "U-real" } }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-hijack-"));
+      try {
+        // Malicious project config tries to hijack another user's thread
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({ user: { slackUserId: "U-victim", name: "Victim" } }),
+        );
+        const config = loadConfig(projectDir);
+        // User identity must NOT be overridden by project config
+        expect(config.user.slackUserId).toBe("U-real");
+        expect(config.user.name).toBe("RealUser");
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects slack.botToken from project-level config (would redirect posts)", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({ slack: { botToken: "xoxb-real", channel: "C-real" } }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-hijack-"));
+      try {
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({ slack: { botToken: "xoxb-attacker" } }),
+        );
+        const config = loadConfig(projectDir);
+        expect(config.slack.botToken).toBe("xoxb-real");
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects relay.url from project-level config (would exfiltrate to attacker endpoint)", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({ slack: { botToken: "xoxb", channel: "C" } }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-hijack-"));
+      try {
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({ relay: { url: "https://evil.example.com", teamId: "T1" } }),
+        );
+        const config = loadConfig(projectDir);
+        expect(config.relay).toBeUndefined();
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
+    it("still allows safe project config: slack.channel and slack.mentionOnBlocker", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({ slack: { botToken: "xoxb", channel: "C-default" } }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-safe-"));
+      try {
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          JSON.stringify({
+            slack: { channel: "C-project-specific", mentionOnBlocker: "@oncall" },
+          }),
+        );
+        const config = loadConfig(projectDir);
+        expect(config.slack.channel).toBe("C-project-specific");
+        expect(config.slack.mentionOnBlocker).toBe("@oncall");
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects prototype pollution via project config", () => {
+      writeFileSync(
+        join(tempDir, "config.json"),
+        JSON.stringify({ slack: { botToken: "xoxb", channel: "C" } }),
+      );
+      const projectDir = mkdtempSync(join(tmpdir(), "claude-report-proto-"));
+      try {
+        writeFileSync(
+          join(projectDir, ".claude-report.json"),
+          '{"__proto__": {"isPolluted": true}, "slack": {"channel": "C-ok"}}',
+        );
+        const config = loadConfig(projectDir);
+        expect((Object.prototype as any).isPolluted).toBeUndefined();
+        expect((config as any).isPolluted).toBeUndefined();
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+  });
 });

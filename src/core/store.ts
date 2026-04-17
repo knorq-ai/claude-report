@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { getStateDir } from "./config.js";
-import { atomicWriteJson } from "./fs-utils.js";
+import { atomicWriteJson, withFileLock, LockTimeoutError } from "./fs-utils.js";
 import type { Session, StatusUpdate, Store } from "./types.js";
 
 const SCHEMA_VERSION = 1;
@@ -14,7 +14,8 @@ interface StoreData<T> {
 
 /**
  * JSON file-based store. Sufficient for ~50 records/day/dev.
- * Uses atomic writes (write-to-temp-then-rename) for safety.
+ * All mutations go through `withFileLock` to prevent lost updates
+ * under concurrent hook processes.
  */
 export class JsonFileStore implements Store {
   private stateDir: string;
@@ -28,9 +29,10 @@ export class JsonFileStore implements Store {
 
   async saveSession(session: Session): Promise<void> {
     const file = this.path("sessions.json");
-    const sessions = this.readFile<Record<string, Session>>(file, {});
-    sessions[sessionKey(session.userId, session.project)] = session;
-    this.writeFile(file, sessions);
+    this.mutate<Record<string, Session>>(file, {}, (sessions) => {
+      sessions[sessionKey(session.userId, session.project)] = session;
+      return sessions;
+    });
   }
 
   async getActiveSession(
@@ -47,14 +49,15 @@ export class JsonFileStore implements Store {
     updates: Partial<Session>,
   ): Promise<void> {
     const file = this.path("sessions.json");
-    const sessions = this.readFile<Record<string, Session>>(file, {});
-    for (const key of Object.keys(sessions)) {
-      if (sessions[key].sessionId === sessionId) {
-        Object.assign(sessions[key], updates);
-        this.writeFile(file, sessions);
-        return;
+    this.mutate<Record<string, Session>>(file, {}, (sessions) => {
+      for (const key of Object.keys(sessions)) {
+        if (sessions[key].sessionId === sessionId) {
+          Object.assign(sessions[key], updates);
+          break;
+        }
       }
-    }
+      return sessions;
+    });
   }
 
   // --- Updates ---
@@ -63,16 +66,13 @@ export class JsonFileStore implements Store {
     update: StatusUpdate & { threadId: string },
   ): Promise<void> {
     const file = this.path("updates.json");
-    const updates = this.readFile<Array<StatusUpdate & { threadId: string }>>(
-      file,
-      [],
-    );
-    updates.push(update);
-    // Rotate: keep last N
-    if (updates.length > MAX_UPDATES_KEPT) {
-      updates.splice(0, updates.length - MAX_UPDATES_KEPT);
-    }
-    this.writeFile(file, updates);
+    this.mutate<Array<StatusUpdate & { threadId: string }>>(file, [], (updates) => {
+      updates.push(update);
+      if (updates.length > MAX_UPDATES_KEPT) {
+        updates.splice(0, updates.length - MAX_UPDATES_KEPT);
+      }
+      return updates;
+    });
   }
 
   async getRecentUpdates(
@@ -97,15 +97,38 @@ export class JsonFileStore implements Store {
 
   async setLastSeenReplyTimestamp(threadId: string, ts: Date): Promise<void> {
     const file = this.path("reply-watermarks.json");
-    const watermarks = this.readFile<Record<string, string>>(file, {});
-    watermarks[threadId] = ts.toISOString();
-    this.writeFile(file, watermarks);
+    this.mutate<Record<string, string>>(file, {}, (watermarks) => {
+      watermarks[threadId] = ts.toISOString();
+      return watermarks;
+    });
   }
 
   // --- Helpers ---
 
   private path(filename: string): string {
     return join(this.stateDir, filename);
+  }
+
+  /** Read-modify-write under a file lock. */
+  private mutate<T>(
+    filePath: string,
+    defaultValue: T,
+    fn: (current: T) => T,
+  ): void {
+    try {
+      withFileLock(filePath, () => {
+        const current = this.readFile<T>(filePath, defaultValue);
+        const next = fn(current);
+        this.writeFile(filePath, next);
+      });
+    } catch (err) {
+      if (err instanceof LockTimeoutError) {
+        // Lock contention — log and skip rather than silently lose data
+        process.stderr.write(`[claude-report] ${err.message}; skipping write\n`);
+        return;
+      }
+      throw err;
+    }
   }
 
   private readFile<T>(filePath: string, defaultValue: T): T {

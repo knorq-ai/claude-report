@@ -33,6 +33,8 @@ export function resolveProjectName(projectDir: string): string {
       cwd: projectDir,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
+      timeout: 500, // prevent hung git from blocking the hook
+      killSignal: "SIGKILL",
     }).trim();
     if (remote) {
       // Handle both SSH (git@host:org/repo.git) and HTTPS (https://host/org/repo.git)
@@ -40,7 +42,7 @@ export function resolveProjectName(projectDir: string): string {
       if (name) return name;
     }
   } catch {
-    // Not a git repo or no remote
+    // Not a git repo, no remote, or git timed out
   }
 
   // 3. Directory basename
@@ -191,14 +193,21 @@ export function updateSession(updates: Partial<Session>): Session | null {
     }
 
     if (latest && latestFile) {
-      Object.assign(latest, updates, {
-        lastActiveAt: new Date().toISOString(),
+      const latestPath = join(stateDir, latestFile);
+      return withFileLock(latestPath, () => {
+        // Re-read under lock to prevent lost update
+        const current: Session = JSON.parse(readFileSync(latestPath, "utf-8"));
+        Object.assign(current, updates, {
+          lastActiveAt: new Date().toISOString(),
+        });
+        atomicWriteJson(latestPath, current);
+        return current;
       });
-      atomicWriteJson(join(stateDir, latestFile), latest);
-      return latest;
     }
-  } catch {
-    // ignore
+  } catch (err) {
+    if (process.env.CLAUDE_REPORT_DEBUG) {
+      process.stderr.write(`[claude-report] updateSession: ${err instanceof Error ? err.message : err}\n`);
+    }
   }
 
   return null;

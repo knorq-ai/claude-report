@@ -4,10 +4,19 @@ import {
   getOrCreateSession,
   updateSessionForProject,
   resolveProjectName,
+  resolveUserId,
   RateLimiter,
   ContentFilter,
 } from "../core/index.js";
 import type { StatusUpdate, UpdateType } from "../core/index.js";
+
+const VALID_TYPES: ReadonlySet<UpdateType> = new Set<UpdateType>([
+  "status",
+  "blocker",
+  "completion",
+  "pivot",
+  "push",
+]);
 
 export async function post(
   message: string,
@@ -22,17 +31,16 @@ export async function post(
     process.exit(1);
   }
 
-  const project = resolveProjectName(projectDir);
-  const userId = config.user.slackUserId;
-  const session = getOrCreateSession(userId, project);
-  const rateLimiter = new RateLimiter(config.rateLimit);
-  const contentFilter = new ContentFilter();
-
-  const VALID_TYPES = new Set(["status", "blocker", "completion", "pivot", "push"]);
-  if (!VALID_TYPES.has(options.type)) {
+  if (!VALID_TYPES.has(options.type as UpdateType)) {
     console.error(`  Invalid type: ${options.type}. Valid: ${[...VALID_TYPES].join(", ")}`);
     process.exit(1);
   }
+
+  const project = resolveProjectName(projectDir);
+  const userId = resolveUserId(config);
+  const session = getOrCreateSession(userId, project);
+  const rateLimiter = new RateLimiter(config.rateLimit);
+  const contentFilter = new ContentFilter();
 
   const update: StatusUpdate = {
     type: options.type as UpdateType,

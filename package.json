@@ -22,7 +22,6 @@
     "dist",
     ".claude-plugin",
     ".mcp.json",
-    "hooks",
     "skills",
     "claude-md-snippet.md",
     "slack-app-manifest.json",

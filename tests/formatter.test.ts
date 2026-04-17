@@ -3,6 +3,7 @@ import {
   formatSlackBlocks,
   formatDailyParent,
   formatPlainText,
+  escapeSlackMrkdwn,
 } from "../src/core/formatter.js";
 import type { StatusUpdate } from "../src/core/types.js";
 
@@ -75,5 +76,46 @@ describe("formatPlainText", () => {
   it("formats blocker type", () => {
     const text = formatPlainText(makeUpdate({ type: "blocker" }), "Yuya");
     expect(text).toContain("[Blocker]");
+  });
+});
+
+describe("escapeSlackMrkdwn — security", () => {
+  it("neutralizes <!channel> broadcast", () => {
+    const escaped = escapeSlackMrkdwn("Hey <!channel> heads up");
+    // Angle brackets must be entity-encoded so Slack doesn't parse the control sequence
+    expect(escaped).not.toContain("<!channel>");
+    expect(escaped).toContain("&lt;!channel&gt;");
+  });
+
+  it("neutralizes <!here> and <!everyone>", () => {
+    expect(escapeSlackMrkdwn("<!here>")).toContain("&lt;!here&gt;");
+    expect(escapeSlackMrkdwn("<!everyone>")).toContain("&lt;!everyone&gt;");
+  });
+
+  it("neutralizes @channel / @here / @everyone raw mentions", () => {
+    for (const mention of ["@channel", "@here", "@everyone", "@CHANNEL"]) {
+      const escaped = escapeSlackMrkdwn(`ping ${mention}`);
+      // Zero-width space inserted between @ and keyword defuses auto-linking
+      expect(escaped).not.toMatch(new RegExp(`${mention}\\b`));
+    }
+  });
+
+  it("neutralizes <@U123> user mention control sequence", () => {
+    const escaped = escapeSlackMrkdwn("<@U12345>");
+    expect(escaped).not.toContain("<@");
+    expect(escaped).toContain("&lt;@U12345&gt;");
+  });
+
+  it("neutralizes mrkdwn formatting chars", () => {
+    const escaped = escapeSlackMrkdwn("*bold* _italic_ ~strike~ `code`");
+    // Zero-width space precedes each formatting trigger
+    expect(escaped).toContain("\u200B*");
+    expect(escaped).toContain("\u200B_");
+    expect(escaped).toContain("\u200B~");
+    expect(escaped).toContain("\u200B`");
+  });
+
+  it("preserves benign text unchanged", () => {
+    expect(escapeSlackMrkdwn("Hello, world!")).toBe("Hello, world!");
   });
 });

@@ -16,17 +16,22 @@ vi.mock("../src/core/config.js", async () => {
   };
 });
 
-// Mock the WebClient to avoid real Slack calls
+// Mock the WebClient to avoid real Slack calls. Welcome.ts uses a default
+// import due to @slack/web-api being CJS, so we mock both the default and
+// named exports.
+const MockWebClientImpl = vi.fn().mockImplementation(() => ({
+  chat: {
+    postMessage: vi.fn().mockResolvedValue({ ok: true, ts: "1234.5678" }),
+  },
+}));
 vi.mock("@slack/web-api", () => ({
-  WebClient: vi.fn().mockImplementation(() => ({
-    chat: {
-      postMessage: vi.fn().mockResolvedValue({ ok: true, ts: "1234.5678" }),
-    },
-  })),
+  default: { WebClient: MockWebClientImpl },
+  WebClient: MockWebClientImpl,
+  retryPolicies: { fiveRetriesInFiveMinutes: {} },
 }));
 
 const { sendWelcomeIfNeeded } = await import("../src/core/welcome.js");
-const { WebClient } = await import("@slack/web-api");
+const WebClient = MockWebClientImpl;
 
 function makeConfig(overrides: Record<string, any> = {}) {
   return {
@@ -70,12 +75,11 @@ describe("sendWelcomeIfNeeded", () => {
   });
 
   it("does not write marker if Slack call fails", async () => {
-    const MockWebClient = vi.fn().mockImplementation(() => ({
+    WebClient.mockImplementationOnce(() => ({
       chat: {
         postMessage: vi.fn().mockRejectedValue(new Error("Slack API error")),
       },
-    }));
-    vi.mocked(WebClient).mockImplementation(MockWebClient as any);
+    }) as any);
 
     await sendWelcomeIfNeeded(makeConfig());
     expect(existsSync(join(tempDir, "welcome-sent.json"))).toBe(false);

@@ -3,7 +3,7 @@
  * Transcripts live at ~/.claude/projects/{project-slug}/{session-id}.jsonl
  */
 
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { escapeSlackMrkdwn } from "./formatter.js";
@@ -145,9 +145,17 @@ export function getDailyUsage(date: string): DailyUsage {
   return { date, sessions, totals, estimatedCostUsd, activities };
 }
 
+/** Skip transcripts larger than this to cap memory use on pathological sessions. */
+const MAX_TRANSCRIPT_BYTES = 200 * 1024 * 1024; // 200 MB
+
 function parseTranscript(filePath: string, date: string, project: string): SessionUsage | null {
   let content: string;
   try {
+    const st = statSync(filePath);
+    if (st.size > MAX_TRANSCRIPT_BYTES) {
+      process.stderr.write(`[claude-report] skipping oversized transcript: ${filePath} (${Math.round(st.size / 1_048_576)}MB)\n`);
+      return null;
+    }
     content = readFileSync(filePath, "utf-8");
   } catch { return null; }
 
@@ -174,7 +182,8 @@ function parseTranscript(filePath: string, date: string, project: string): Sessi
     // Filter by date using the entry timestamp (local timezone, not UTC)
     const ts = entry.timestamp;
     const entryDate = ts ? localDateString(new Date(ts)) : null;
-    const timeStr = ts ? new Date(ts).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }) : "";
+    // Use explicit "en-GB" (24h) to pin format regardless of host locale
+    const timeStr = ts ? new Date(ts).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "";
 
     // Count real user prompts (exclude tool_result messages which the API sends as role:user)
     if (entry.type === "user" && entryDate === date) {
@@ -314,19 +323,34 @@ function extractBashActivities(cmd: string, activities: Activity[], ts: string):
   }
 }
 
-/** Extract the real cwd from the first user/assistant entry in a transcript */
+/**
+ * Extract the real cwd from the first user/assistant entry.
+ * Reads only the prefix of the file (cwd is always in the first entry),
+ * so we don't pull a 100MB transcript into memory just to find one field.
+ */
 function extractCwdFromTranscript(filePath: string): string | null {
+  const CWD_SCAN_BYTES = 8 * 1024; // 8KB — plenty for the first few JSON entries
+  let fd: number | null = null;
   try {
-    const fd = readFileSync(filePath, "utf-8");
-    // Only scan first 50 lines for performance
-    const lines = fd.split("\n", 50);
-    for (const line of lines) {
+    fd = openSync(filePath, "r");
+    const buf = Buffer.alloc(CWD_SCAN_BYTES);
+    const bytesRead = readSync(fd, buf, 0, CWD_SCAN_BYTES, 0);
+    const text = buf.slice(0, bytesRead).toString("utf-8");
+    const lines = text.split("\n");
+    // Drop the last line — it may be truncated. If the file is shorter than
+    // CWD_SCAN_BYTES, the last element will be an empty string anyway.
+    const completeLines = lines.slice(0, -1);
+    for (const line of completeLines) {
       try {
         const entry = JSON.parse(line);
         if (entry.cwd && typeof entry.cwd === "string") return entry.cwd;
       } catch { continue; }
     }
-  } catch { /* ignore */ }
+  } catch { /* ignore */ } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* */ }
+    }
+  }
   return null;
 }
 
@@ -347,10 +371,17 @@ function projectNameFromPath(cwd: string): string {
   return segments.slice(-2).join("/");
 }
 
+/**
+ * Yesterday of the given YYYY-MM-DD in local time.
+ * Must be consistent with `localDateString` (both local TZ) — mixing UTC and
+ * local causes off-by-one near day boundaries.
+ */
 function prevDate(date: string): string {
-  const d = new Date(date);
-  d.setDate(d.getDate() - 1);
-  return d.toISOString().slice(0, 10);
+  const [y, m, d] = date.split("-").map((s) => Number.parseInt(s, 10));
+  if (!y || !m || !d) return date; // malformed — don't crash
+  const dt = new Date(y, m - 1, d);
+  dt.setDate(dt.getDate() - 1);
+  return localDateString(dt);
 }
 
 function findPricing(model: string) {

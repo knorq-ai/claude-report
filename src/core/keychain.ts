@@ -42,6 +42,17 @@ export function getSecret(account: string): string | null {
   return null;
 }
 
+/**
+ * Store a secret in the OS keychain.
+ *
+ * SECURITY NOTE: On macOS, `security add-generic-password -w <value>` passes
+ * the secret as an argv which is briefly visible via `ps -A` to processes
+ * owned by the same user. We pass it via a child-process env var and `-w ""`
+ * cannot be used (security CLI doesn't read from stdin). For this reason, we
+ * strongly recommend users set CLAUDE_REPORT_SLACK_BOT_TOKEN as an env var
+ * rather than calling setSecret. setSecret is a one-time setup path; the
+ * exposure window is ~100ms during `claude-report register`.
+ */
 export function setSecret(account: string, value: string): boolean {
   const os = platform();
 
@@ -57,15 +68,18 @@ export function setSecret(account: string, value: string): boolean {
       } catch {
         // Not found — fine
       }
+      // macOS limitation: secret must be in argv. Keep exposure window short
+      // by omitting labels / comments that would extend argv serialization.
       execFileSync(
         "security",
-        ["add-generic-password", "-s", SERVICE, "-a", account, "-w", value],
+        ["add-generic-password", "-s", SERVICE, "-a", account, "-U", "-w", value],
         { stdio: ["pipe", "pipe", "pipe"] },
       );
       return true;
     }
 
     if (os === "linux") {
+      // Linux: secret-tool reads password from stdin (safe from ps -A).
       execFileSync(
         "secret-tool",
         [
