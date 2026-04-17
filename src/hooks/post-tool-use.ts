@@ -175,18 +175,23 @@ export function detectTaskEvent(
   input: Record<string, any>,
   output: string,
   rawResponse?: unknown,
+  taskSubjectLookup?: (taskId: string) => string | undefined,
 ): DetectedEvent | null {
   // TaskUpdate with status "completed"
   if (input.status === "completed" && input.taskId) {
     const parsed = parseTaskOutput(output);
-    // Claude Code's tool_response for TaskUpdate is a structured object
-    // containing the task details (subject, description, etc.)
+    // Claude Code's tool_response for TaskUpdate does NOT include the subject
+    // (it only carries {success, taskId, updatedFields, statusChange}).
+    // Subject must come from: input (rare — Claude usually updates status
+    // without the full subject), a prior TaskCreate/TaskUpdate cached by the
+    // hook, or parsed from output. Falls back to `#${taskId}`.
     const resp = (typeof rawResponse === "object" && rawResponse !== null)
       ? rawResponse as Record<string, unknown>
       : undefined;
     const subject = input.subject
       || parsed.subject
       || (typeof resp?.subject === "string" ? resp.subject : undefined)
+      || (taskSubjectLookup?.(String(input.taskId)))
       || `#${input.taskId}`;
     const details = parsed.description
       || (typeof resp?.description === "string" ? resp.description : undefined);
@@ -262,6 +267,102 @@ const EVENT_ICONS: Record<string, string> = {
 };
 
 // ---------------------------------------------------------------------------
+// Task subject cache — maps taskId → subject so TaskUpdate can report the
+// task's human-readable name (TaskUpdate response contains only {taskId,
+// status}, never the subject).
+// ---------------------------------------------------------------------------
+
+const TASK_CACHE_MAX_ENTRIES = 200;
+
+function taskCachePath(): string {
+  const fsPath = require("node:path") as typeof import("node:path");
+  const { getStateDir } = require("../core/index.js");
+  return fsPath.join(getStateDir(), "task-subjects.json");
+}
+
+function readTaskCache(): Record<string, string> {
+  const fs = require("node:fs") as typeof import("node:fs");
+  const path = taskCachePath();
+  if (!fs.existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path, "utf-8"));
+    return typeof parsed === "object" && parsed !== null ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeTaskCache(cache: Record<string, string>): void {
+  const path = taskCachePath();
+  try {
+    withFileLock(path, () => {
+      // Bound cache size — drop oldest entries if exceeded (simple FIFO via
+      // insertion order; V8 preserves insertion order for string keys).
+      const keys = Object.keys(cache);
+      if (keys.length > TASK_CACHE_MAX_ENTRIES) {
+        const trimmed: Record<string, string> = {};
+        for (const k of keys.slice(-TASK_CACHE_MAX_ENTRIES)) trimmed[k] = cache[k];
+        cache = trimmed;
+      }
+      const path2 = taskCachePath(); // re-compute inside lock
+      const fs = require("node:fs") as typeof import("node:fs");
+      fs.writeFileSync(path2, JSON.stringify(cache, null, 2), "utf-8");
+    });
+  } catch {
+    // best-effort — if the cache can't be written, we'll fall back to #N
+  }
+}
+
+/** Look up the subject for a task ID (returns undefined if not cached). */
+function lookupTaskSubject(taskId: string): string | undefined {
+  return readTaskCache()[taskId];
+}
+
+/** Record a task's subject for future TaskUpdate events. */
+function cacheTaskSubject(taskId: string, subject: string): void {
+  const cache = readTaskCache();
+  cache[taskId] = subject;
+  writeTaskCache(cache);
+}
+
+/**
+ * Extract the task subject from a TaskCreate tool response.
+ * The response can be either:
+ *   - structured: {task: {id, subject}}  (toolUseResult shape)
+ *   - string: "Task #N created successfully: <subject>"  (tool_result content)
+ *   - {stdout: "Task #N created successfully: <subject>"}  (Bash-shaped wrapper)
+ */
+function extractTaskCreateSubject(
+  toolInput: Record<string, any>,
+  rawResponse: unknown,
+  outputText: string,
+): { taskId: string; subject: string } | null {
+  // 1. Structured response (best signal)
+  if (typeof rawResponse === "object" && rawResponse !== null) {
+    const resp = rawResponse as Record<string, unknown>;
+    if (resp.task && typeof resp.task === "object") {
+      const t = resp.task as Record<string, unknown>;
+      if (typeof t.id === "string" && typeof t.subject === "string") {
+        return { taskId: t.id, subject: t.subject };
+      }
+    }
+    if (typeof resp.subject === "string" && typeof resp.taskId === "string") {
+      return { taskId: resp.taskId, subject: resp.subject };
+    }
+  }
+  // 2. Text response: "Task #N created successfully: <subject>"
+  const textMatch = outputText.match(/Task\s+#(\S+)\s+created\s+successfully:\s*(.+)$/m);
+  if (textMatch) {
+    return { taskId: textMatch[1], subject: textMatch[2].trim() };
+  }
+  // 3. Fall back to tool_input if it carries the subject (TaskCreate usually does)
+  if (typeof toolInput?.subject === "string" && toolInput.taskId) {
+    return { taskId: String(toolInput.taskId), subject: toolInput.subject };
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -303,8 +404,22 @@ async function main(): Promise<void> {
   if (input.tool_name === "Bash") {
     const command = input.tool_input?.command || "";
     event = detectBashEvent(command, output);
+  } else if (input.tool_name === "TaskCreate") {
+    // TaskCreate doesn't trigger a Slack event, but we DO cache the subject
+    // so that when TaskUpdate status=completed fires later, we can report
+    // the real subject instead of just the task ID.
+    const extracted = extractTaskCreateSubject(input.tool_input || {}, input.tool_response, output);
+    if (extracted) {
+      cacheTaskSubject(extracted.taskId, extracted.subject);
+    }
+    return; // no Slack event for TaskCreate itself
   } else if (input.tool_name === "TaskUpdate") {
-    event = detectTaskEvent(input.tool_input, output, input.tool_response);
+    event = detectTaskEvent(
+      input.tool_input,
+      output,
+      input.tool_response,
+      lookupTaskSubject,
+    );
   }
 
   if (!event) return;

@@ -403,6 +403,31 @@ describe("detectTaskEvent", () => {
     expect(result!.summary).toBe("Task completed: #7");
   });
 
+  it("uses taskSubjectLookup when tool_input/response have no subject", () => {
+    // Real-world shape: TaskUpdate response is {success, taskId, ...} with no subject
+    const lookup = (id: string) =>
+      ({ "7": "Fix authentication middleware" }[id]);
+    const result = detectTaskEvent(
+      { taskId: "7", status: "completed" },
+      "",
+      { success: true, taskId: "7", updatedFields: ["status"] },
+      lookup,
+    );
+    expect(result!.summary).toBe("Task completed: Fix authentication middleware");
+  });
+
+  it("prefers input.subject over lookup fallback", () => {
+    const lookup = (id: string) =>
+      ({ "7": "Cached subject" }[id]);
+    const result = detectTaskEvent(
+      { taskId: "7", status: "completed", subject: "Explicit subject" },
+      "",
+      undefined,
+      lookup,
+    );
+    expect(result!.summary).toBe("Task completed: Explicit subject");
+  });
+
   it("returns null for non-completed tasks", () => {
     const result = detectTaskEvent(
       { taskId: "7", status: "in_progress" },
