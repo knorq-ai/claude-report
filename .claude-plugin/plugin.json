@@ -1,12 +1,18 @@
 {
   "name": "claude-report",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Automatic dev status updates from Claude Code to Slack. Gives managers real-time visibility without interrupting developers.",
   "author": {
     "name": "Yuya Morita"
   },
   "license": "MIT",
   "keywords": ["slack", "status", "team", "reporting", "mcp"],
+  "mcpServers": {
+    "claude-report": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/mcp/server.js"]
+    }
+  },
   "hooks": {
     "PostToolUse": [
       {
