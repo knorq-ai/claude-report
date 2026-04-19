@@ -17,10 +17,6 @@ Post a daily token usage summary to the team Slack channel by parsing local Clau
 
 ## Automatic daily posting
 
-To schedule this to run automatically every day at 19:00 JST (10:00 UTC), the user should run:
+For a persistent daily 19:00 report that survives reboots, run `/install-daily-report`. It installs a launchd job on macOS.
 
-```
-/schedule create --cron "0 10 * * *" --prompt "call report_usage for yesterday's date"
-```
-
-This is a one-time setup. After that, a daily usage summary will be posted to Slack automatically.
+The old `/schedule-usage` path creates a session-only CronCreate that expires after 7 days; prefer `/install-daily-report` for team distribution.

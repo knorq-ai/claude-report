@@ -185,7 +185,7 @@ async function postStatusUpdate(
 // ---------------------------------------------------------------------------
 
 const server = new McpServer(
-  { name: "claude-report", version: "0.1.0" },
+  { name: "claude-report", version: "0.1.2" },
   { capabilities: { tools: {} } },
 );
 
@@ -394,6 +394,34 @@ server.tool(
       };
     }
 
+    // Drop sessions from projects the user has opted out via .claude-report.ignore.
+    // Only checks sessions whose absolute cwd is recoverable (older transcripts without
+    // cwd fall through — best-effort, not a hard privacy guarantee).
+    const ignoredProjects = new Set<string>();
+    const filteredSessions = usage.sessions.filter((s) => {
+      if (s.cwd && isProjectDisabled(s.cwd)) {
+        ignoredProjects.add(s.project);
+        return false;
+      }
+      return true;
+    });
+    if (ignoredProjects.size > 0) {
+      usage.sessions = filteredSessions;
+      // Recompute totals after filtering
+      const t = usage.totals;
+      t.inputTokens = 0; t.outputTokens = 0; t.cacheReadTokens = 0;
+      t.cacheWriteTokens = 0; t.userMessages = 0; t.assistantTurns = 0;
+      t.sessionCount = filteredSessions.length;
+      for (const s of filteredSessions) {
+        t.inputTokens += s.inputTokens;
+        t.outputTokens += s.outputTokens;
+        t.cacheReadTokens += s.cacheReadTokens;
+        t.cacheWriteTokens += s.cacheWriteTokens;
+        t.userMessages += s.userMessages;
+        t.assistantTurns += s.assistantTurns;
+      }
+    }
+
     const { totals, estimatedCostUsd } = usage;
     const rawSnippets = getProjectSnippets(usage);
 
@@ -454,7 +482,13 @@ server.tool(
     const usage = getDailyUsage(date);
     const userName = ctx.config.user.name || "Unknown";
     const safeName = escapeSlackMrkdwn(userName);
-    const { totals, estimatedCostUsd, sessions } = usage;
+
+    // Privacy filter: drop sessions from opted-out projects.
+    const filteredSessions = usage.sessions.filter(
+      (s) => !(s.cwd && isProjectDisabled(s.cwd)),
+    );
+    const { totals, estimatedCostUsd } = usage;
+    const sessions = filteredSessions;
 
     // Build per-project stats map
     const byProject = new Map<string, { tokens: number; prompts: number }>();
@@ -516,6 +550,220 @@ server.tool(
     } catch (err) {
       return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : err}` }] };
     }
+  },
+);
+
+// ---- verify_setup ----------------------------------------------------------
+
+server.tool(
+  "verify_setup",
+  "Run a smoke test of the claude-report install: checks config, posts a [verify] message to the configured Slack channel, and reports what works and what doesn't. Safe to run at any time — the verify message is clearly marked and does not affect daily status threads.",
+  {},
+  async () => {
+    const lines: string[] = [];
+    const ctx = resolveContext();
+
+    lines.push(`## claude-report verify — ${new Date().toISOString()}`);
+    lines.push("");
+    lines.push(`- user name:      ${ctx.config.user.name || "(not set)"}`);
+    lines.push(`- slack token:    ${ctx.config.slack.botToken ? "set (" + ctx.config.slack.botToken.slice(0, 8) + "…)" : "MISSING"}`);
+    lines.push(`- slack channel:  ${ctx.config.slack.channel || "MISSING"}`);
+    lines.push(`- data dir:       ${process.env.CLAUDE_REPORT_DATA_DIR || process.env.CLAUDE_PLUGIN_DATA || "~/.claude-report"}`);
+    lines.push(`- project (cwd):  ${ctx.project}`);
+    lines.push("");
+
+    if (!ctx.config.slack.botToken || !ctx.config.slack.channel) {
+      lines.push("❌ Slack not fully configured. Cannot run live post test.");
+      lines.push("   Set slack_bot_token and slack_channel via `/plugin` config, or via");
+      lines.push("   CLAUDE_REPORT_SLACK_BOT_TOKEN / CLAUDE_REPORT_SLACK_CHANNEL env vars.");
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+
+    try {
+      const client = new WebClient(ctx.config.slack.botToken, { timeout: 5000 });
+
+      // Resolve channel → channel ID (if name was given)
+      let channelId = ctx.config.slack.channel;
+      let channelLabel = channelId;
+      try {
+        const auth = await client.auth.test();
+        lines.push(`✅ auth.test ok — bot user: ${auth.user} (team: ${auth.team})`);
+      } catch (err) {
+        lines.push(`❌ auth.test failed: ${err instanceof Error ? err.message : err}`);
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+
+      // Post the verify message
+      const res = await client.chat.postMessage({
+        channel: channelId,
+        text: `🧪 *[claude-report verify]* ${ctx.config.user.name || "unknown user"} — setup check at ${new Date().toISOString()}. If you see this message, your daily 19:00 report pipeline is working end-to-end.`,
+      });
+      lines.push(`✅ chat.postMessage ok — channel: ${channelLabel} (resolved: ${res.channel}) ts: ${res.ts}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      lines.push(`❌ chat.postMessage failed: ${msg}`);
+      if (msg.includes("not_in_channel")) {
+        lines.push("   → Invite the bot to the channel: /invite @<bot-name> in Slack.");
+      } else if (msg.includes("invalid_auth") || msg.includes("token_revoked")) {
+        lines.push("   → Bot token is invalid. Regenerate from api.slack.com and update config.");
+      } else if (msg.includes("channel_not_found")) {
+        lines.push("   → Channel ID or name is wrong, or the bot cannot see the channel.");
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+
+    lines.push("");
+    lines.push("✅ All checks passed. Your setup is ready. The daily 19:00 report will post to the same channel.");
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  },
+);
+
+// ---- install_daily_report --------------------------------------------------
+
+server.tool(
+  "install_daily_report",
+  "Install the macOS launchd job that posts a daily usage summary at 19:00 local time. Generates the plist with the current user's paths and loads it. Idempotent — safe to run again to refresh the schedule.",
+  {
+    hour: z.number().int().min(0).max(23).optional().describe("Hour (local time) to fire. Default 18."),
+    minute: z.number().int().min(0).max(59).optional().describe("Minute to fire. Default 57."),
+  },
+  async ({ hour, minute }) => {
+    const { execSync } = await import("node:child_process");
+    const { writeFileSync, mkdirSync, existsSync } = await import("node:fs");
+    const { homedir, platform } = await import("node:os");
+    const { join, dirname } = await import("node:path");
+
+    if (platform() !== "darwin") {
+      return {
+        content: [{
+          type: "text",
+          text: "install_daily_report currently only supports macOS (launchd). Linux/systemd support is tracked; for now, set up a cron job that runs `$CLAUDE_PLUGIN_ROOT/bin/daily-usage-wrapper.sh` at 18:57 local.",
+        }],
+      };
+    }
+
+    const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || process.env.CLAUDE_REPORT_PLUGIN_DIR;
+    if (!pluginRoot) {
+      return {
+        content: [{
+          type: "text",
+          text: "Cannot resolve plugin root. This tool must be called from within a Claude Code plugin session so CLAUDE_PLUGIN_ROOT is set.",
+        }],
+      };
+    }
+
+    const wrapperPath = join(pluginRoot, "bin", "daily-usage-wrapper.sh");
+    if (!existsSync(wrapperPath)) {
+      return {
+        content: [{ type: "text", text: `Wrapper script not found at ${wrapperPath}. Run \`npm run build\` in the plugin repo first.` }],
+      };
+    }
+
+    // Resolve claude binary via PATH (inherited from login shell)
+    let claudeBin = "";
+    try {
+      claudeBin = execSync("command -v claude", { encoding: "utf-8" }).trim();
+    } catch { /* fall through */ }
+
+    const logDir = join(homedir(), ".claude-report", "logs");
+    mkdirSync(logDir, { recursive: true });
+
+    const label = "com.claude-report.daily-usage";
+    const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
+    mkdirSync(dirname(plistPath), { recursive: true });
+
+    const h = hour ?? 18;
+    const m = minute ?? 57;
+
+    const envEntries: Array<[string, string]> = [
+      ["PATH", `${claudeBin ? dirname(claudeBin) + ":" : ""}/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin`],
+      ["HOME", homedir()],
+      ["CLAUDE_REPORT_PLUGIN_DIR", pluginRoot],
+    ];
+    if (claudeBin) envEntries.push(["CLAUDE_BIN", claudeBin]);
+
+    const xmlEscape = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+    const envXml = envEntries
+      .map(([k, v]) => `        <key>${xmlEscape(k)}</key>\n        <string>${xmlEscape(v)}</string>`)
+      .join("\n");
+
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${xmlEscape(wrapperPath)}</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>${xmlEscape(pluginRoot)}</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>${h}</integer>
+        <key>Minute</key>
+        <integer>${m}</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>${xmlEscape(join(logDir, "daily-usage-stdout.log"))}</string>
+
+    <key>StandardErrorPath</key>
+    <string>${xmlEscape(join(logDir, "daily-usage-stderr.log"))}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+${envXml}
+    </dict>
+</dict>
+</plist>
+`;
+    writeFileSync(plistPath, plist, "utf-8");
+
+    const uid = process.getuid ? process.getuid() : null;
+    if (uid === null) {
+      return {
+        content: [{ type: "text", text: `Wrote plist to ${plistPath} but could not determine UID; load manually with \`launchctl bootstrap gui/$(id -u) ${plistPath}\`.` }],
+      };
+    }
+
+    // Reload: bootout (may fail if not loaded — ignore) then bootstrap
+    try { execSync(`launchctl bootout gui/${uid} "${plistPath}"`, { stdio: "pipe" }); } catch { /* not loaded */ }
+    try {
+      execSync(`launchctl bootstrap gui/${uid} "${plistPath}"`, { stdio: "pipe" });
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Wrote plist to ${plistPath} but launchctl bootstrap failed: ${err instanceof Error ? err.message : err}` }],
+      };
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: [
+          `✅ Daily usage report scheduled.`,
+          ``,
+          `- plist:         ${plistPath}`,
+          `- fires at:      ${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")} local, daily`,
+          `- wrapper:       ${wrapperPath}`,
+          `- claude bin:    ${claudeBin || "(resolved from PATH at run time)"}`,
+          `- plugin root:   ${pluginRoot}`,
+          `- logs:          ${logDir}/daily-usage-stdout.log, daily-usage-stderr.log`,
+          ``,
+          `Next step: run verify_setup to confirm Slack posts work before the first scheduled fire.`,
+          ``,
+          `Note: if your Mac is asleep at the scheduled time, launchd fires on next wake, not at exactly 19:00.`,
+        ].join("\n"),
+      }],
+    };
   },
 );
 

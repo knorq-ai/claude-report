@@ -3,10 +3,37 @@
 # Exits non-zero if the MCP tools aren't reachable or if the Slack post didn't succeed,
 # so launchd (and any higher-level monitor) can distinguish a real post from a
 # hallucinated "explanation" of failure.
+#
+# Portable. Resolves paths from environment / script location; does not hardcode
+# the plugin author's home or homebrew prefix.
 
 set -u
 
-PLUGIN_DIR="/Users/yuyamorita/Projects/claude-report"
+# Resolve plugin dir: env override → two levels up from this script → fail.
+if [ -n "${CLAUDE_REPORT_PLUGIN_DIR:-}" ]; then
+  PLUGIN_DIR="$CLAUDE_REPORT_PLUGIN_DIR"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+
+if [ ! -f "$PLUGIN_DIR/dist/mcp/server.js" ]; then
+  echo "wrapper: plugin dir $PLUGIN_DIR does not look like a built claude-report checkout (missing dist/mcp/server.js)" >&2
+  exit 10
+fi
+
+# Resolve claude binary: env override → PATH lookup → fail loudly.
+if [ -n "${CLAUDE_BIN:-}" ]; then
+  CLAUDE_CMD="$CLAUDE_BIN"
+else
+  CLAUDE_CMD="$(command -v claude || true)"
+fi
+
+if [ -z "$CLAUDE_CMD" ] || [ ! -x "$CLAUDE_CMD" ]; then
+  echo "wrapper: could not locate 'claude' executable. Set CLAUDE_BIN or ensure claude is on PATH." >&2
+  exit 11
+fi
+
 TMP_OUT="$(mktemp -t claude-report-daily.XXXXXX)"
 trap 'rm -f "$TMP_OUT"' EXIT
 
@@ -16,7 +43,7 @@ Hard constraints:
 - If the report_usage or post_usage_to_slack MCP tools are not available, print exactly the line "FATAL: MCP unavailable" and stop. Do not suggest webhooks, do not propose alternative Slack integrations, do not output summary tables.
 - On a successful Slack post, ensure the final line of your output contains the exact marker "DAILY_USAGE_POSTED_OK". If the post_usage_to_slack tool returns an error, print "FATAL: Slack post failed" and stop.'
 
-/usr/bin/timeout 600 /opt/homebrew/bin/claude \
+"$CLAUDE_CMD" \
   -p "$PROMPT" \
   --plugin-dir "$PLUGIN_DIR" \
   --permission-mode bypassPermissions \

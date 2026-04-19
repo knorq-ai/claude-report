@@ -159,63 +159,29 @@ claude-report status                     # Show session state
 
 ## Scheduling the Daily Report
 
-### Option A: In-Session (session-only)
+### Recommended: `/install-daily-report` (macOS, persistent)
+
+Run the skill from any Claude Code session that has the plugin loaded:
+
+```
+/install-daily-report
+```
+
+This generates a launchd plist with correctly-resolved paths for your machine, loads it via `launchctl bootstrap`, and logs to `~/.claude-report/logs/daily-usage-{stdout,stderr}.log`. Runs daily at 18:57 local (the post lands around 19:00 after the `claude -p` session finishes summarizing). Re-run the skill any time to refresh the schedule.
+
+Before the first scheduled fire, run `/verify` to confirm Slack posts work end-to-end.
+
+### Alternative: `/schedule-usage` (session-only, 7-day expiry)
 
 ```
 /schedule-usage
 ```
 
-Creates a cron job at 19:00 local time. Dies when the Claude Code session ends.
+Session-scoped CronCreate — dies when the Claude Code session ends, auto-expires after 7 days. Use only for ad-hoc demos; `/install-daily-report` is the right choice for real distribution.
 
-### Option B: macOS launchd (persistent)
+### Linux
 
-Create `~/Library/LaunchAgents/com.claude-report.daily-usage.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.claude-report.daily-usage</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/opt/homebrew/bin/claude</string>
-        <string>-p</string>
-        <string>Call report_usage for today's date. Write 1-line Japanese summaries per project, then call post_usage_to_slack.</string>
-        <string>--plugin-dir</string>
-        <string>/path/to/claude-report</string>
-        <string>--permission-mode</string>
-        <string>bypassPermissions</string>
-        <string>--model</string>
-        <string>sonnet</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>/path/to/claude-report</string>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>19</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-        <key>HOME</key>
-        <string>/Users/yourname</string>
-        <key>CLAUDE_REPORT_DATA_DIR</key>
-        <string>/Users/yourname/.claude/plugins/data/claude-report-claude-report-marketplace</string>
-    </dict>
-</dict>
-</plist>
-```
-
-```bash
-launchctl load ~/Library/LaunchAgents/com.claude-report.daily-usage.plist
-```
+`/install-daily-report` is macOS-only today. On Linux, create a systemd timer that runs `$CLAUDE_PLUGIN_ROOT/bin/daily-usage-wrapper.sh` at 18:57 local, with `CLAUDE_REPORT_PLUGIN_DIR` and `CLAUDE_BIN` exported in the unit's environment.
 
 ## Safety & Privacy
 
@@ -229,13 +195,13 @@ launchctl load ~/Library/LaunchAgents/com.claude-report.daily-usage.plist
 ## Development
 
 ```bash
-git clone https://github.com/knorq-ai/claude-report
+git clone https://github.com/knorq-ai/claude-report.git
 cd claude-report
 npm install
 npm run build
 npm test
 
-# Test locally as a plugin
+# Test locally as a plugin (without installing from a marketplace)
 claude --plugin-dir .
 ```
 

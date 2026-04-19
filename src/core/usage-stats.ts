@@ -17,6 +17,8 @@ export interface Activity {
 export interface SessionUsage {
   sessionId: string;
   project: string;
+  /** Absolute cwd at session start, when recoverable from the transcript. */
+  cwd?: string;
   model: string;
   inputTokens: number;
   outputTokens: number;
@@ -102,6 +104,7 @@ export function getDailyUsage(date: string): DailyUsage {
         const project = cwd ? projectNameFromPath(cwd) : fallbackProject;
         const usage = parseTranscript(filePath, date, project);
         if (usage && usage.assistantTurns > 0) {
+          if (cwd) usage.cwd = cwd;
           sessions.push(usage);
         }
       } catch { continue; }
