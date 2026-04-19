@@ -13,35 +13,81 @@ claude-report integrates with Claude Code to provide two layers of visibility:
 
 The plugin also surfaces manager feedback: replies on Slack threads are automatically injected into the developer's next Claude Code session.
 
-## Quick Start
+## Team Rollout
 
-### 1. Create a Slack App
+claude-report is designed to be rolled out to a whole engineering team so every developer's daily activity and 19:00 usage summary land in one shared channel. The flow splits into a one-time setup by a team lead and a ~2-minute install per teammate.
 
-Go to [api.slack.com/apps](https://api.slack.com/apps) and create a new app **from manifest**. Paste the contents of [`slack-app-manifest.json`](./slack-app-manifest.json). Install it to your workspace and copy the **Bot User OAuth Token** (`xoxb-...`).
+### Team Lead — one-time setup
 
-Invite the bot to your target channel:
+**1. Create the shared Slack app**
+
+Go to [api.slack.com/apps](https://api.slack.com/apps), create an app **from manifest**, paste [`slack-app-manifest.json`](./slack-app-manifest.json). Install to your workspace; copy the **Bot User OAuth Token** (`xoxb-…`). Invite the bot into the channel where daily reports should land (`/invite @Claude Report`).
+
+The team shares one bot token + one channel. Per-user threading is handled inside the plugin (thread per git-email-hash), so there's no per-user app setup.
+
+**2. Publish the plugin to a marketplace**
+
+Push this repo to a public (or org-internal) GitHub repo and keep `.claude-plugin/marketplace.json` at the root.
+
+**3. Share the install instructions**
+
+Send teammates the block below with the bot token and channel ID filled in.
+
+### Teammate — install (~2 minutes)
 
 ```
-/invite @Claude Report
+# 1. Register the marketplace (one-time)
+/plugin marketplace add knorq-ai/claude-report
+
+# 2. Install the plugin
+/plugin install claude-report@claude-report-marketplace
 ```
 
-### 2. Install the Plugin
-
-```bash
-claude plugin install claude-report
-```
-
-Claude Code will prompt for three values:
+Claude Code prompts for three values at install:
 
 | Prompt | Value |
 |--------|-------|
-| **Slack Bot Token** | `xoxb-...` from step 1 |
-| **Slack Channel ID** | Channel ID from Slack channel details (e.g. `C0AS7LC0X9B`) |
+| **Slack Bot Token** | `xoxb-…` (from the team lead) |
+| **Slack Channel ID** | Channel ID, e.g. `C0AS7LC0X9B` (from the team lead) |
 | **Display Name** | Your name as shown in Slack posts |
 
-### 3. Restart Claude Code
+Then reload and set up the daily schedule:
 
-The plugin's hooks and MCP server activate on session startup.
+```
+/reload-plugins
+/install-daily-report
+/verify
+```
+
+`/install-daily-report` writes a launchd plist and loads it (macOS). `/verify` runs nine checks (Slack auth, channel membership, plist, launchd job loaded, wrapper executable, dist built, `claude` on PATH). If all green, your daily 19:00 report is live and will survive reboots.
+
+If any check fails, the output includes the exact remediation. Common ones:
+- `auth.test: invalid_auth` → bot token pasted wrong; rerun `/plugin config claude-report`.
+- `chat.postMessage: not_in_channel` → bot isn't in the channel; `/invite @Claude Report` in Slack.
+- `claude on PATH (login shell): not resolvable` → ensure `claude` is in `/usr/local/bin` or `/opt/homebrew/bin` (or set `CLAUDE_BIN` in the plist).
+
+### Opting a repo out
+
+`echo > .claude-report.ignore` in any project root. The file is honored by both the real-time activity log **and** the 19:00 usage report (tokens, prompts, and estimated cost from opted-out projects are stripped from the Slack header, not just the per-project breakdown).
+
+### Updating
+
+When the team lead ships a new version:
+
+```
+/plugin marketplace update claude-report-marketplace
+/plugin update claude-report
+/reload-plugins
+/install-daily-report   # refresh the plist with the new wrapper/paths
+```
+
+### Linux teammates
+
+`/install-daily-report` is macOS-only today. On Linux, create a systemd timer that runs `$CLAUDE_PLUGIN_ROOT/bin/daily-usage-wrapper.sh` at 18:57 local with `CLAUDE_REPORT_PLUGIN_DIR`, `CLAUDE_REPORT_DATA_DIR=$HOME/.claude-report`, and `CLAUDE_BIN` exported. See [`bin/daily-usage-wrapper.sh`](./bin/daily-usage-wrapper.sh) for the expected contract.
+
+### What survives `/plugin uninstall`
+
+The durable config and state live at `~/.claude-report/` (config.json, state/, logs/). Plugin-data (`$CLAUDE_PLUGIN_DATA`) is wiped by `/plugin uninstall`. `/install-daily-report` migrates `$CLAUDE_PLUGIN_DATA/config.json` → `~/.claude-report/config.json` on first run so teammates who configured via `/plugin` keep their Slack creds across reinstalls.
 
 ## How It Works
 
@@ -143,7 +189,9 @@ claude-report status                     # Show session state
 |---------|-------------|
 | `/report` | Post a manual status update — Claude summarizes the session |
 | `/usage` | Post a daily token usage summary to Slack |
-| `/schedule-usage` | Set up automatic daily usage reporting |
+| `/install-daily-report` | Install the persistent 19:00 launchd job (macOS) |
+| `/verify` | Smoke-test the full setup — Slack auth, channel, plist, launchd, wrapper, dist, PATH |
+| `/schedule-usage` | Legacy session-only scheduler (prefer `/install-daily-report` for real distribution) |
 
 ### MCP Tools
 
@@ -155,33 +203,9 @@ claude-report status                     # Show session state
 | `fetch_feedback` | Fetch manager replies from the Slack thread |
 | `report_usage` | Get daily usage stats and per-project activity snippets |
 | `post_usage_to_slack` | Post usage summary with AI-generated project summaries |
+| `verify_setup` | Run the 9-check setup smoke test |
+| `install_daily_report` | Generate and load the macOS launchd plist |
 | `report_mute` / `report_unmute` | Pause/resume posting |
-
-## Scheduling the Daily Report
-
-### Recommended: `/install-daily-report` (macOS, persistent)
-
-Run the skill from any Claude Code session that has the plugin loaded:
-
-```
-/install-daily-report
-```
-
-This generates a launchd plist with correctly-resolved paths for your machine, loads it via `launchctl bootstrap`, and logs to `~/.claude-report/logs/daily-usage-{stdout,stderr}.log`. Runs daily at 18:57 local (the post lands around 19:00 after the `claude -p` session finishes summarizing). Re-run the skill any time to refresh the schedule.
-
-Before the first scheduled fire, run `/verify` to confirm Slack posts work end-to-end.
-
-### Alternative: `/schedule-usage` (session-only, 7-day expiry)
-
-```
-/schedule-usage
-```
-
-Session-scoped CronCreate — dies when the Claude Code session ends, auto-expires after 7 days. Use only for ad-hoc demos; `/install-daily-report` is the right choice for real distribution.
-
-### Linux
-
-`/install-daily-report` is macOS-only today. On Linux, create a systemd timer that runs `$CLAUDE_PLUGIN_ROOT/bin/daily-usage-wrapper.sh` at 18:57 local, with `CLAUDE_REPORT_PLUGIN_DIR` and `CLAUDE_BIN` exported in the unit's environment.
 
 ## Safety & Privacy
 
