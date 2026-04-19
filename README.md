@@ -96,11 +96,11 @@ The durable config and state live at `~/.claude-report/` (config.json, state/, l
 Hooks fire on every Bash and TaskUpdate tool call. Detected events are posted as compact log entries to a **single daily thread per user**:
 
 ```
-📋 Yuya — Activity Log (2026-04-15)
-  ├─ `Projects/claude-report` 🚀 Pushed to main
-  ├─ `valorize/valorize-app` 📝 Committed: fix Vercel build permission error
-  ├─ `firstlooptechnology/davie` ✅ Task completed: Add anomaly detection processor
-  └─ `Projects/claude-report` 🛑 Tests failing: 3 failures
+📋 Alex — Activity Log (2026-04-15)
+  ├─ `acme/web-app`      🚀 Pushed to main
+  ├─ `acme/api-gateway`  📝 Committed: fix auth middleware redirect loop
+  ├─ `acme/data-pipeline` ✅ Task completed: Add anomaly detection processor
+  └─ `acme/web-app`      🛑 Tests failing: 3 failures
 ```
 
 | Event | Icon | Example |
