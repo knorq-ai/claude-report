@@ -43,13 +43,24 @@ Hard constraints:
 - If the report_usage or post_usage_to_slack MCP tools are not available, print exactly the line "FATAL: MCP unavailable" and stop. Do not suggest webhooks, do not propose alternative Slack integrations, do not output summary tables.
 - On a successful Slack post, ensure the final line of your output contains the exact marker "DAILY_USAGE_POSTED_OK". If the post_usage_to_slack tool returns an error, print "FATAL: Slack post failed" and stop.'
 
-"$CLAUDE_CMD" \
+# Run with a 600s hard timeout. macOS doesn't ship coreutils `timeout`, so use
+# perl's alarm (present on every macOS). exec replaces perl with claude so the
+# alarm signal targets the right process.
+TIMEOUT_SECS="${CLAUDE_REPORT_TIMEOUT_SECS:-600}"
+/usr/bin/perl -e 'alarm shift; exec @ARGV or exit 127' "$TIMEOUT_SECS" \
+  "$CLAUDE_CMD" \
   -p "$PROMPT" \
   --plugin-dir "$PLUGIN_DIR" \
   --permission-mode bypassPermissions \
   --model sonnet \
   > "$TMP_OUT" 2>&1
 claude_exit=$?
+
+# perl's alarm() kills the process with SIGALRM (exit code 142 in bash: 128+14).
+if [ "$claude_exit" = "142" ]; then
+  echo "wrapper: claude -p exceeded ${TIMEOUT_SECS}s timeout (SIGALRM)" >&2
+  exit 4
+fi
 
 cat "$TMP_OUT"
 

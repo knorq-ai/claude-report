@@ -19,6 +19,7 @@ import {
   getDailyUsage,
   formatUsageSlackBlocks,
   getProjectSnippets,
+  recomputeUsageTotals,
   escapeSlackMrkdwn,
 } from "../core/index.js";
 import type {
@@ -185,7 +186,7 @@ async function postStatusUpdate(
 // ---------------------------------------------------------------------------
 
 const server = new McpServer(
-  { name: "claude-report", version: "0.1.2" },
+  { name: "claude-report", version: "0.1.3" },
   { capabilities: { tools: {} } },
 );
 
@@ -394,32 +395,16 @@ server.tool(
       };
     }
 
-    // Drop sessions from projects the user has opted out via .claude-report.ignore.
-    // Only checks sessions whose absolute cwd is recoverable (older transcripts without
-    // cwd fall through — best-effort, not a hard privacy guarantee).
-    const ignoredProjects = new Set<string>();
-    const filteredSessions = usage.sessions.filter((s) => {
-      if (s.cwd && isProjectDisabled(s.cwd)) {
-        ignoredProjects.add(s.project);
-        return false;
-      }
-      return true;
-    });
-    if (ignoredProjects.size > 0) {
-      usage.sessions = filteredSessions;
-      // Recompute totals after filtering
-      const t = usage.totals;
-      t.inputTokens = 0; t.outputTokens = 0; t.cacheReadTokens = 0;
-      t.cacheWriteTokens = 0; t.userMessages = 0; t.assistantTurns = 0;
-      t.sessionCount = filteredSessions.length;
-      for (const s of filteredSessions) {
-        t.inputTokens += s.inputTokens;
-        t.outputTokens += s.outputTokens;
-        t.cacheReadTokens += s.cacheReadTokens;
-        t.cacheWriteTokens += s.cacheWriteTokens;
-        t.userMessages += s.userMessages;
-        t.assistantTurns += s.assistantTurns;
-      }
+    // Drop sessions from projects the user has opted out via .claude-report.ignore,
+    // then recompute totals AND estimatedCostUsd so header stats stay consistent with
+    // the per-project breakdown (ignored tokens/cost must not leak to Slack).
+    // Older transcripts without cwd fall through the filter — best-effort; document
+    // in README that users should keep .claude-report.ignore at the project root so
+    // fresh sessions pick it up.
+    const filtered = usage.sessions.filter((s) => !(s.cwd && isProjectDisabled(s.cwd)));
+    if (filtered.length !== usage.sessions.length) {
+      usage.sessions = filtered;
+      recomputeUsageTotals(usage);
     }
 
     const { totals, estimatedCostUsd } = usage;
@@ -483,12 +468,15 @@ server.tool(
     const userName = ctx.config.user.name || "Unknown";
     const safeName = escapeSlackMrkdwn(userName);
 
-    // Privacy filter: drop sessions from opted-out projects.
-    const filteredSessions = usage.sessions.filter(
+    // Privacy filter: drop opted-out projects and recompute totals + cost.
+    const filtered = usage.sessions.filter(
       (s) => !(s.cwd && isProjectDisabled(s.cwd)),
     );
-    const { totals, estimatedCostUsd } = usage;
-    const sessions = filteredSessions;
+    if (filtered.length !== usage.sessions.length) {
+      usage.sessions = filtered;
+      recomputeUsageTotals(usage);
+    }
+    const { totals, estimatedCostUsd, sessions } = usage;
 
     // Build per-project stats map
     const byProject = new Map<string, { tokens: number; prompts: number }>();
@@ -557,63 +545,141 @@ server.tool(
 
 server.tool(
   "verify_setup",
-  "Run a smoke test of the claude-report install: checks config, posts a [verify] message to the configured Slack channel, and reports what works and what doesn't. Safe to run at any time — the verify message is clearly marked and does not affect daily status threads.",
+  "Run a smoke test of the claude-report install. Checks config, Slack auth, channel membership, AND the scheduled path (launchd job loaded, plist present, wrapper executable, dist built, claude resolvable). Safe to run anytime — the verify message to Slack is clearly marked.",
   {},
   async () => {
+    const { existsSync, statSync, accessSync, constants } = await import("node:fs");
+    const { spawnSync } = await import("node:child_process");
+    const { homedir, platform } = await import("node:os");
+    const { join } = await import("node:path");
+
     const lines: string[] = [];
+    const warnings: string[] = [];
+    const errors: string[] = [];
     const ctx = resolveContext();
+
+    const push = (label: string, ok: boolean, detail: string, remediation?: string) => {
+      const icon = ok ? "✅" : "❌";
+      lines.push(`${icon} ${label}: ${detail}`);
+      if (!ok) {
+        errors.push(label);
+        if (remediation) lines.push(`   → ${remediation}`);
+      }
+    };
 
     lines.push(`## claude-report verify — ${new Date().toISOString()}`);
     lines.push("");
-    lines.push(`- user name:      ${ctx.config.user.name || "(not set)"}`);
-    lines.push(`- slack token:    ${ctx.config.slack.botToken ? "set (" + ctx.config.slack.botToken.slice(0, 8) + "…)" : "MISSING"}`);
-    lines.push(`- slack channel:  ${ctx.config.slack.channel || "MISSING"}`);
-    lines.push(`- data dir:       ${process.env.CLAUDE_REPORT_DATA_DIR || process.env.CLAUDE_PLUGIN_DATA || "~/.claude-report"}`);
-    lines.push(`- project (cwd):  ${ctx.project}`);
+    lines.push("### Config");
+    lines.push(`- user name:     ${ctx.config.user.name || "(not set)"}`);
+    lines.push(`- slack token:   ${ctx.config.slack.botToken ? "set (" + ctx.config.slack.botToken.slice(0, 8) + "…)" : "MISSING"}`);
+    lines.push(`- slack channel: ${ctx.config.slack.channel || "MISSING"}`);
+    lines.push(`- data dir:      ${process.env.CLAUDE_REPORT_DATA_DIR || process.env.CLAUDE_PLUGIN_DATA || join(homedir(), ".claude-report")}`);
+    lines.push(`- plugin root:   ${process.env.CLAUDE_PLUGIN_ROOT || "(not set — verify_setup expects to run inside a plugin session)"}`);
+    lines.push(`- project (cwd): ${ctx.project}`);
     lines.push("");
 
+    // ---- 1) Slack live check ----
+    lines.push("### Slack pipeline (live)");
     if (!ctx.config.slack.botToken || !ctx.config.slack.channel) {
-      lines.push("❌ Slack not fully configured. Cannot run live post test.");
-      lines.push("   Set slack_bot_token and slack_channel via `/plugin` config, or via");
-      lines.push("   CLAUDE_REPORT_SLACK_BOT_TOKEN / CLAUDE_REPORT_SLACK_CHANNEL env vars.");
-      return { content: [{ type: "text", text: lines.join("\n") }] };
-    }
-
-    try {
-      const client = new WebClient(ctx.config.slack.botToken, { timeout: 5000 });
-
-      // Resolve channel → channel ID (if name was given)
-      let channelId = ctx.config.slack.channel;
-      let channelLabel = channelId;
+      push("slack config", false, "bot token or channel missing",
+        "set slack_bot_token / slack_channel via `/plugin` or CLAUDE_REPORT_SLACK_BOT_TOKEN / CLAUDE_REPORT_SLACK_CHANNEL env vars");
+    } else {
       try {
-        const auth = await client.auth.test();
-        lines.push(`✅ auth.test ok — bot user: ${auth.user} (team: ${auth.team})`);
+        const client = new WebClient(ctx.config.slack.botToken, { timeout: 5000 });
+        try {
+          const auth = await client.auth.test();
+          push("auth.test", true, `bot user ${auth.user} (team ${auth.team})`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          push("auth.test", false, msg, "bot token is invalid; regenerate from api.slack.com");
+          throw err;
+        }
+        const res = await client.chat.postMessage({
+          channel: ctx.config.slack.channel,
+          text: `🧪 *[claude-report verify]* ${ctx.config.user.name || "unknown user"} — setup check at ${new Date().toISOString()}. If you see this, interactive posting works; the scheduled-path checks below say whether the 19:00 job will too.`,
+        });
+        push("chat.postMessage", true, `channel ${ctx.config.slack.channel} → ${res.channel}, ts ${res.ts}`);
       } catch (err) {
-        lines.push(`❌ auth.test failed: ${err instanceof Error ? err.message : err}`);
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        const msg = err instanceof Error ? err.message : String(err);
+        let hint: string | undefined;
+        if (msg.includes("not_in_channel")) hint = "invite the bot to the channel: /invite @<bot-name>";
+        else if (msg.includes("channel_not_found")) hint = "channel ID/name wrong, or bot can't see it";
+        else if (msg.includes("invalid_auth") || msg.includes("token_revoked")) hint = "regenerate the bot token";
+        if (!errors.includes("chat.postMessage")) push("chat.postMessage", false, msg, hint);
+      }
+    }
+    lines.push("");
+
+    // ---- 2) Scheduled-path checks (macOS only) ----
+    lines.push("### Scheduled path (launchd)");
+    if (platform() !== "darwin") {
+      lines.push(`(skipped: non-macOS platform ${platform()}) run daily-usage-wrapper.sh under your scheduler of choice`);
+    } else {
+      const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || process.env.CLAUDE_REPORT_PLUGIN_DIR;
+      const label = "com.claude-report.daily-usage";
+      const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
+
+      // Plist present
+      if (existsSync(plistPath)) push("plist present", true, plistPath);
+      else push("plist present", false, `not found at ${plistPath}`,
+        "run /install-daily-report to generate and load the plist");
+
+      // launchd job loaded?
+      const uid = process.getuid ? process.getuid() : null;
+      if (uid === null) {
+        warnings.push("could not determine UID; skipped launchctl check");
+      } else {
+        const r = spawnSync("launchctl", ["print", `gui/${uid}/${label}`], { encoding: "utf-8" });
+        if (r.status === 0) {
+          push("launchd job loaded", true, `gui/${uid}/${label}`);
+        } else {
+          const stderr = (r.stderr || "").trim() || (r.stdout || "").trim() || `exit ${r.status}`;
+          push("launchd job loaded", false, stderr, "run /install-daily-report to bootstrap it");
+        }
       }
 
-      // Post the verify message
-      const res = await client.chat.postMessage({
-        channel: channelId,
-        text: `🧪 *[claude-report verify]* ${ctx.config.user.name || "unknown user"} — setup check at ${new Date().toISOString()}. If you see this message, your daily 19:00 report pipeline is working end-to-end.`,
-      });
-      lines.push(`✅ chat.postMessage ok — channel: ${channelLabel} (resolved: ${res.channel}) ts: ${res.ts}`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      lines.push(`❌ chat.postMessage failed: ${msg}`);
-      if (msg.includes("not_in_channel")) {
-        lines.push("   → Invite the bot to the channel: /invite @<bot-name> in Slack.");
-      } else if (msg.includes("invalid_auth") || msg.includes("token_revoked")) {
-        lines.push("   → Bot token is invalid. Regenerate from api.slack.com and update config.");
-      } else if (msg.includes("channel_not_found")) {
-        lines.push("   → Channel ID or name is wrong, or the bot cannot see the channel.");
+      // Wrapper + dist checks (only when plugin root is known)
+      if (!pluginRoot) {
+        push("wrapper executable", false, "CLAUDE_PLUGIN_ROOT not set — cannot locate wrapper",
+          "run this tool from inside a Claude Code plugin session");
+      } else {
+        const wrapper = join(pluginRoot, "bin", "daily-usage-wrapper.sh");
+        if (!existsSync(wrapper)) {
+          push("wrapper present", false, wrapper, "reinstall the plugin");
+        } else {
+          try {
+            accessSync(wrapper, constants.X_OK);
+            push("wrapper executable", true, wrapper);
+          } catch {
+            push("wrapper executable", false, `not +x: ${wrapper}`, `chmod +x ${wrapper}`);
+          }
+        }
+        const distMcp = join(pluginRoot, "dist", "mcp", "server.js");
+        if (existsSync(distMcp)) push("dist/mcp/server.js built", true, distMcp);
+        else push("dist/mcp/server.js built", false, `not found: ${distMcp}`, "run `npm run build` in the plugin root");
       }
-      return { content: [{ type: "text", text: lines.join("\n") }] };
+
+      // claude binary resolvable from a login shell (approximates launchd's env less strictly,
+      // but catches the common "claude not on PATH" footgun)
+      const which = spawnSync("bash", ["-lc", "command -v claude"], { encoding: "utf-8" });
+      const claudeBin = (which.stdout || "").trim();
+      if (which.status === 0 && claudeBin) push("claude on PATH (login shell)", true, claudeBin);
+      else push("claude on PATH (login shell)", false, "not resolvable",
+        "set CLAUDE_BIN in the plist env, or install claude into /usr/local/bin / /opt/homebrew/bin");
     }
 
     lines.push("");
-    lines.push("✅ All checks passed. Your setup is ready. The daily 19:00 report will post to the same channel.");
+    if (errors.length === 0) {
+      lines.push("✅ All checks passed. Both the interactive post and the scheduled 19:00 path look healthy.");
+    } else {
+      lines.push(`❌ ${errors.length} check(s) failed: ${errors.join(", ")}.`);
+      lines.push("Fix the items above before relying on the daily report. Remediation hints are inline.");
+    }
+    if (warnings.length) {
+      lines.push("");
+      lines.push("Warnings:");
+      for (const w of warnings) lines.push(`- ${w}`);
+    }
     return { content: [{ type: "text", text: lines.join("\n") }] };
   },
 );
@@ -628,8 +694,8 @@ server.tool(
     minute: z.number().int().min(0).max(59).optional().describe("Minute to fire. Default 57."),
   },
   async ({ hour, minute }) => {
-    const { execSync } = await import("node:child_process");
-    const { writeFileSync, mkdirSync, existsSync } = await import("node:fs");
+    const { spawnSync } = await import("node:child_process");
+    const { writeFileSync, mkdirSync, existsSync, copyFileSync, readFileSync } = await import("node:fs");
     const { homedir, platform } = await import("node:os");
     const { join, dirname } = await import("node:path");
 
@@ -637,7 +703,7 @@ server.tool(
       return {
         content: [{
           type: "text",
-          text: "install_daily_report currently only supports macOS (launchd). Linux/systemd support is tracked; for now, set up a cron job that runs `$CLAUDE_PLUGIN_ROOT/bin/daily-usage-wrapper.sh` at 18:57 local.",
+          text: "install_daily_report currently only supports macOS (launchd). On Linux, set up a systemd timer that runs `$CLAUDE_PLUGIN_ROOT/bin/daily-usage-wrapper.sh` at 18:57 local with CLAUDE_REPORT_PLUGIN_DIR and CLAUDE_BIN exported.",
         }],
       };
     }
@@ -645,32 +711,62 @@ server.tool(
     const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || process.env.CLAUDE_REPORT_PLUGIN_DIR;
     if (!pluginRoot) {
       return {
-        content: [{
-          type: "text",
-          text: "Cannot resolve plugin root. This tool must be called from within a Claude Code plugin session so CLAUDE_PLUGIN_ROOT is set.",
-        }],
+        content: [{ type: "text", text: "Cannot resolve plugin root. Call this tool from a Claude Code plugin session so CLAUDE_PLUGIN_ROOT is set." }],
       };
     }
 
     const wrapperPath = join(pluginRoot, "bin", "daily-usage-wrapper.sh");
+    const distMcp = join(pluginRoot, "dist", "mcp", "server.js");
     if (!existsSync(wrapperPath)) {
-      return {
-        content: [{ type: "text", text: `Wrapper script not found at ${wrapperPath}. Run \`npm run build\` in the plugin repo first.` }],
-      };
+      return { content: [{ type: "text", text: `Wrapper not found at ${wrapperPath}. Reinstall the plugin.` }] };
+    }
+    if (!existsSync(distMcp)) {
+      return { content: [{ type: "text", text: `Plugin is not built: ${distMcp} missing. Run \`npm run build\` in ${pluginRoot} first.` }] };
     }
 
-    // Resolve claude binary via PATH (inherited from login shell)
-    let claudeBin = "";
-    try {
-      claudeBin = execSync("command -v claude", { encoding: "utf-8" }).trim();
-    } catch { /* fall through */ }
+    // Resolve claude binary via a login shell (captures user's PATH including
+    // nvm/asdf/homebrew) using argv — no shell-string interpolation.
+    const which = spawnSync("bash", ["-lc", "command -v claude"], { encoding: "utf-8" });
+    const claudeBin = which.status === 0 ? (which.stdout || "").trim() : "";
 
-    const logDir = join(homedir(), ".claude-report", "logs");
+    // Durable config path: /plugin uninstall wipes CLAUDE_PLUGIN_DATA, so pin the
+    // scheduled job at ~/.claude-report which survives. Migrate an existing
+    // CLAUDE_PLUGIN_DATA config.json into it on first install so users who
+    // configured via /plugin keep their Slack creds across reinstalls.
+    const durableDataDir = join(homedir(), ".claude-report");
+    mkdirSync(durableDataDir, { recursive: true });
+    const durableConfigPath = join(durableDataDir, "config.json");
+    const migratedFrom: string[] = [];
+    if (!existsSync(durableConfigPath)) {
+      const pluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+      if (pluginDataDir) {
+        const src = join(pluginDataDir, "config.json");
+        if (existsSync(src)) {
+          try {
+            copyFileSync(src, durableConfigPath);
+            migratedFrom.push(src);
+          } catch { /* best-effort */ }
+        }
+      }
+    }
+
+    const logDir = join(durableDataDir, "logs");
     mkdirSync(logDir, { recursive: true });
 
     const label = "com.claude-report.daily-usage";
     const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
     mkdirSync(dirname(plistPath), { recursive: true });
+
+    // Backup any existing plist before overwriting — users may have customized
+    // Hour/Minute or added their own env vars.
+    let backupPath: string | null = null;
+    if (existsSync(plistPath)) {
+      try {
+        const existing = readFileSync(plistPath, "utf-8");
+        backupPath = `${plistPath}.bak.${Date.now()}`;
+        writeFileSync(backupPath, existing, "utf-8");
+      } catch { backupPath = null; }
+    }
 
     const h = hour ?? 18;
     const m = minute ?? 57;
@@ -679,11 +775,19 @@ server.tool(
       ["PATH", `${claudeBin ? dirname(claudeBin) + ":" : ""}/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin`],
       ["HOME", homedir()],
       ["CLAUDE_REPORT_PLUGIN_DIR", pluginRoot],
+      // Pin the child to the durable data dir so config/state are consistent
+      // with what the interactive MCP tools read/write.
+      ["CLAUDE_REPORT_DATA_DIR", durableDataDir],
     ];
     if (claudeBin) envEntries.push(["CLAUDE_BIN", claudeBin]);
 
-    const xmlEscape = (s: string) =>
-      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    // XML escaping for plist: handle &, <, >, ", ' (all reserved in XML attrs/text).
+    const xmlEscape = (s: string) => s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&apos;");
 
     const envXml = envEntries
       .map(([k, v]) => `        <key>${xmlEscape(k)}</key>\n        <string>${xmlEscape(v)}</string>`)
@@ -735,35 +839,32 @@ ${envXml}
       };
     }
 
-    // Reload: bootout (may fail if not loaded — ignore) then bootstrap
-    try { execSync(`launchctl bootout gui/${uid} "${plistPath}"`, { stdio: "pipe" }); } catch { /* not loaded */ }
-    try {
-      execSync(`launchctl bootstrap gui/${uid} "${plistPath}"`, { stdio: "pipe" });
-    } catch (err) {
+    // argv-based — no shell interpolation, no quoting surface on plistPath.
+    spawnSync("launchctl", ["bootout", `gui/${uid}`, plistPath], { stdio: "pipe" });
+    const bootstrap = spawnSync("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "pipe", encoding: "utf-8" });
+    if (bootstrap.status !== 0) {
+      const stderr = (bootstrap.stderr || "").trim() || `exit ${bootstrap.status}`;
       return {
-        content: [{ type: "text", text: `Wrote plist to ${plistPath} but launchctl bootstrap failed: ${err instanceof Error ? err.message : err}` }],
+        content: [{ type: "text", text: `Wrote plist to ${plistPath} but launchctl bootstrap failed: ${stderr}` }],
       };
     }
 
-    return {
-      content: [{
-        type: "text",
-        text: [
-          `✅ Daily usage report scheduled.`,
-          ``,
-          `- plist:         ${plistPath}`,
-          `- fires at:      ${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")} local, daily`,
-          `- wrapper:       ${wrapperPath}`,
-          `- claude bin:    ${claudeBin || "(resolved from PATH at run time)"}`,
-          `- plugin root:   ${pluginRoot}`,
-          `- logs:          ${logDir}/daily-usage-stdout.log, daily-usage-stderr.log`,
-          ``,
-          `Next step: run verify_setup to confirm Slack posts work before the first scheduled fire.`,
-          ``,
-          `Note: if your Mac is asleep at the scheduled time, launchd fires on next wake, not at exactly 19:00.`,
-        ].join("\n"),
-      }],
-    };
+    const outLines = [
+      `✅ Daily usage report scheduled.`,
+      ``,
+      `- plist:         ${plistPath}`,
+      `- fires at:      ${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")} local, daily`,
+      `- wrapper:       ${wrapperPath}`,
+      `- claude bin:    ${claudeBin || "(resolved from PATH at run time)"}`,
+      `- plugin root:   ${pluginRoot}`,
+      `- data dir:      ${durableDataDir} (pinned via CLAUDE_REPORT_DATA_DIR)`,
+      `- logs:          ${logDir}/daily-usage-{stdout,stderr}.log`,
+    ];
+    if (backupPath) outLines.push(`- backup:        ${backupPath} (previous plist)`);
+    if (migratedFrom.length) outLines.push(`- migrated:      ${migratedFrom.join(", ")} → ${durableConfigPath}`);
+    outLines.push(``, `Next step: run /verify (verify_setup) to confirm both the live Slack post and the scheduled path.`, ``, `Note: if your Mac is asleep at the scheduled time, launchd fires on next wake, not at exactly ${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}.`);
+
+    return { content: [{ type: "text", text: outLines.join("\n") }] };
   },
 );
 

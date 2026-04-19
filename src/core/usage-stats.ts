@@ -387,6 +387,33 @@ function prevDate(date: string): string {
   return localDateString(dt);
 }
 
+/**
+ * Recompute `totals` AND `estimatedCostUsd` from `usage.sessions`.
+ * Call after mutating `usage.sessions` (e.g. filtering out opted-out projects)
+ * so the header stats and cost stay in sync with the per-project breakdown.
+ */
+export function recomputeUsageTotals(usage: DailyUsage): void {
+  const t = usage.totals;
+  t.inputTokens = 0; t.outputTokens = 0; t.cacheReadTokens = 0;
+  t.cacheWriteTokens = 0; t.userMessages = 0; t.assistantTurns = 0;
+  t.sessionCount = usage.sessions.length;
+  let cost = 0;
+  for (const s of usage.sessions) {
+    t.inputTokens += s.inputTokens;
+    t.outputTokens += s.outputTokens;
+    t.cacheReadTokens += s.cacheReadTokens;
+    t.cacheWriteTokens += s.cacheWriteTokens;
+    t.userMessages += s.userMessages;
+    t.assistantTurns += s.assistantTurns;
+    const p = findPricing(s.model);
+    cost += (s.inputTokens / 1_000_000) * p.input
+          + (s.outputTokens / 1_000_000) * p.output
+          + (s.cacheReadTokens / 1_000_000) * p.cacheRead
+          + (s.cacheWriteTokens / 1_000_000) * p.cacheWrite;
+  }
+  usage.estimatedCostUsd = cost;
+}
+
 function findPricing(model: string) {
   for (const [key, pricing] of Object.entries(PRICING)) {
     if (model.includes(key)) return pricing;
