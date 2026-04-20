@@ -186,7 +186,7 @@ async function postStatusUpdate(
 // ---------------------------------------------------------------------------
 
 const server = new McpServer(
-  { name: "claude-report", version: "0.1.4" },
+  { name: "claude-report", version: "0.1.5" },
   { capabilities: { tools: {} } },
 );
 

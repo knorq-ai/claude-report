@@ -9,7 +9,7 @@
     {
       "name": "claude-report",
       "description": "Automatic dev status updates from Claude Code to Slack",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "author": {
         "name": "Yuya Morita"
       },

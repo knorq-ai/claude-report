@@ -17,11 +17,15 @@ import {
   sendWelcomeIfNeeded,
   escapeSlackMrkdwn,
   getLogDir,
+  getStateDir,
   withFileLock,
+  atomicWriteJson,
 } from "../core/index.js";
 import type { UpdateType, UpdateMetadata } from "../core/index.js";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 /** Post to Slack using raw fetch — no external dependencies needed */
 async function slackPost(token: string, body: Record<string, unknown>): Promise<{ ok: boolean; ts?: string }> {
@@ -275,17 +279,14 @@ const EVENT_ICONS: Record<string, string> = {
 const TASK_CACHE_MAX_ENTRIES = 200;
 
 function taskCachePath(): string {
-  const fsPath = require("node:path") as typeof import("node:path");
-  const { getStateDir } = require("../core/index.js");
-  return fsPath.join(getStateDir(), "task-subjects.json");
+  return join(getStateDir(), "task-subjects.json");
 }
 
 function readTaskCache(): Record<string, string> {
-  const fs = require("node:fs") as typeof import("node:fs");
   const path = taskCachePath();
-  if (!fs.existsSync(path)) return {};
+  if (!existsSync(path)) return {};
   try {
-    const parsed = JSON.parse(fs.readFileSync(path, "utf-8"));
+    const parsed = JSON.parse(readFileSync(path, "utf-8"));
     return typeof parsed === "object" && parsed !== null ? parsed : {};
   } catch {
     return {};
@@ -305,8 +306,7 @@ function writeTaskCache(cache: Record<string, string>): void {
         cache = trimmed;
       }
       const path2 = taskCachePath(); // re-compute inside lock
-      const fs = require("node:fs") as typeof import("node:fs");
-      fs.writeFileSync(path2, JSON.stringify(cache, null, 2), "utf-8");
+      writeFileSync(path2, JSON.stringify(cache, null, 2), "utf-8");
     });
   } catch {
     // best-effort — if the cache can't be written, we'll fall back to #N
@@ -641,7 +641,9 @@ async function acquireThreadId(
       return { state: "wait" as State };
     }
     // Either no threadId, or a stale/dead claim — claim the slot.
-    updateSessionForProject(userId, "activity-log", { threadId: myClaim });
+    // Inline the write because we already hold the file lock; calling
+    // updateSessionForProject here would re-enter the same lock and deadlock.
+    writeSessionFieldsInLock(userId, { threadId: myClaim });
     return { state: "claimed" as State };
   });
 
@@ -663,7 +665,7 @@ async function acquireThreadId(
           const latest = readSessionJson(userId);
           const latestInfo = parseClaim(latest?.threadId ?? null);
           if (latestInfo && latestInfo.stale) {
-            updateSessionForProject(userId, "activity-log", { threadId: myClaim });
+            writeSessionFieldsInLock(userId, { threadId: myClaim });
             return true;
           }
           return false;
@@ -720,16 +722,31 @@ function releaseClaim(userId: string, myClaim: string): void {
     withFileLock(sessionFilePathFor(userId), () => {
       const cur = readSessionJson(userId);
       if (cur?.threadId === myClaim) {
-        updateSessionForProject(userId, "activity-log", { threadId: null });
+        // Inline write — we already hold the lock.
+        writeSessionFieldsInLock(userId, { threadId: null });
       }
     });
   } catch { /* best-effort */ }
 }
 
+/**
+ * Lock-free read-modify-write of the activity-log session file.
+ * MUST be called only from inside a withFileLock block on the same file —
+ * otherwise it races. Used to avoid re-entering the lock via
+ * updateSessionForProject (the mkdir-based lock is non-reentrant).
+ */
+function writeSessionFieldsInLock(userId: string, updates: Record<string, unknown>): void {
+  const path = sessionFilePathFor(userId);
+  if (!existsSync(path)) return;
+  try {
+    const session = JSON.parse(readFileSync(path, "utf-8"));
+    Object.assign(session, updates, { lastActiveAt: new Date().toISOString() });
+    atomicWriteJson(path, session);
+  } catch { /* best-effort */ }
+}
+
 /** Path to the activity-log session file for a user. Mirrors session.ts. */
 function sessionFilePathFor(userId: string): string {
-  const { createHash } = require("node:crypto") as typeof import("node:crypto");
-  const { getStateDir } = require("../core/index.js");
   const hash = createHash("sha256")
     .update(`${userId}:activity-log`)
     .digest("hex")
@@ -738,11 +755,10 @@ function sessionFilePathFor(userId: string): string {
 }
 
 function readSessionJson(userId: string): { threadId: string | null } | null {
-  const fs = require("node:fs") as typeof import("node:fs");
   const filePath = sessionFilePathFor(userId);
-  if (!fs.existsSync(filePath)) return null;
+  if (!existsSync(filePath)) return null;
   try {
-    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    return JSON.parse(readFileSync(filePath, "utf-8"));
   } catch {
     return null;
   }

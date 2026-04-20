@@ -1,6 +1,6 @@
 {
   "name": "claude-report",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Automatic dev status updates from Claude Code to Slack",
   "type": "module",
   "bin": {
