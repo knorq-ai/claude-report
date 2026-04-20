@@ -188,8 +188,17 @@ function parseTranscript(filePath: string, date: string, project: string): Sessi
     // Use explicit "en-GB" (24h) to pin format regardless of host locale
     const timeStr = ts ? new Date(ts).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "";
 
-    // Count real user prompts (exclude tool_result messages which the API sends as role:user)
+    // Count real user prompts. Skip three kinds of role:user entries that are
+    // NOT actual user messages:
+    //   - tool_result: the API protocol sends tool outputs back as role:user
+    //   - isMeta: Claude Code injects local-command stdout, caveats,
+    //     <system-reminder> blocks as user entries tagged isMeta
+    //   - isCompactSummary: the synthetic "session continued..." summary
+    //     Claude Code writes when /compact (manual or auto) fires
+    // Counting them inflates the "Prompts" metric — empirically ~20% over a
+    // mixed workload — and leaks their text into the daily-summary activities.
     if (entry.type === "user" && entryDate === date) {
+      if (entry.isMeta === true || entry.isCompactSummary === true) continue;
       const msgContent = entry.message?.content;
       const isToolResult = Array.isArray(msgContent) && msgContent.some((c: any) => c.type === "tool_result");
       if (!isToolResult) {
