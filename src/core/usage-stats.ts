@@ -83,16 +83,20 @@ export function getDailyUsage(date: string): DailyUsage {
       if (!statSync(dirPath).isDirectory()) continue;
     } catch { continue; }
 
-    // All transcripts under one `~/.claude/projects/<dir>` slug share the same
-    // cwd — Claude Code writes them that way. So we can safely collapse any
-    // cwd-less sessions in this dir onto the readable project name derived
-    // from a sibling transcript that DID have a cwd. This fixes the dupe-row
-    // bug where the same project rendered under two keys (e.g.
-    // `Projects/claude-report` + `-Users-yuyamorita-Projects-claude-report`)
-    // because extractCwdFromTranscript only scans the first 8KB and some
-    // sessions (e.g. compact-summary starts) push the cwd field past that.
+    // Dupe-row guard. extractCwdFromTranscript only scans the first 8 KB, so
+    // sessions that start with a long compact-summary entry push cwd past
+    // the window and fall back to the raw slug `dir` as their project name.
+    // That produces a phantom second row in Slack (e.g. `Projects/claude-report`
+    // + `-Users-yuyamorita-Projects-claude-report`). Fix: inside a slug dir,
+    // if every sibling transcript that DID expose a cwd agrees on the same
+    // canonical project name, fold the cwd-less sessions onto that name.
+    //
+    // Safety: if two siblings disagree (symlink collision, mid-session `cd`
+    // writing to the same slug dir, reused slug across hosts), refuse to fold
+    // and leave cwd-less sessions on the slug name. Silent mis-attribution is
+    // worse than a cosmetic dupe row.
     const dirSessions: SessionUsage[] = [];
-    let canonicalProject: string | null = null;
+    const canonicalNames = new Set<string>();
 
     let files: string[];
     try {
@@ -109,9 +113,7 @@ export function getDailyUsage(date: string): DailyUsage {
         if (fileDate < date && fileDate < prevDate(date)) continue;
 
         const cwd = extractCwdFromTranscript(filePath);
-        if (cwd && !canonicalProject) {
-          canonicalProject = projectNameFromPath(cwd);
-        }
+        if (cwd) canonicalNames.add(projectNameFromPath(cwd));
         const project = cwd ? projectNameFromPath(cwd) : dir;
         const usage = parseTranscript(filePath, date, project);
         if (usage && usage.assistantTurns > 0) {
@@ -121,10 +123,11 @@ export function getDailyUsage(date: string): DailyUsage {
       } catch { continue; }
     }
 
-    // Fold cwd-less sessions in this dir onto the canonical name.
-    if (canonicalProject) {
+    // Only fold when a single canonical name was observed across the slug dir.
+    if (canonicalNames.size === 1) {
+      const canonical = canonicalNames.values().next().value as string;
       for (const s of dirSessions) {
-        if (s.project === dir) s.project = canonicalProject;
+        if (s.project === dir) s.project = canonical;
       }
     }
     sessions.push(...dirSessions);
@@ -523,6 +526,66 @@ function formatTokenCount(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
+}
+
+/** Caps for the per-project bullet rendering — matched to Slack block limits. */
+export const BULLETS_PER_PROJECT_MAX = 10;
+export const BULLET_CHARS_MAX = 200;
+export const PROJECT_NAME_CHARS_MAX = 100;
+/** Slack's per-section text limit is 3000 chars; leave headroom for safety. */
+export const SECTION_CHARS_MAX = 2900;
+
+/**
+ * Render per-project bullet blocks for Slack.
+ * Emits one `section` block per project so no single section can exceed
+ * Slack's 3000-char limit even if a caller sends maxed-out bullets across
+ * many projects. Sanitizes the project name to keep the code span intact
+ * (strips backticks / newlines / tabs, entity-escapes `<` `>` `&`) and
+ * caps each bullet at 200 chars with an ellipsis tail.
+ */
+export function buildProjectBlocks(
+  byProject: Map<string, { tokens: number; prompts: number }>,
+  summaries: Record<string, string[]>,
+): object[] {
+  const sanitizeProjectName = (p: string): string =>
+    p
+      .replace(/[`\n\r\t]/g, "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .slice(0, PROJECT_NAME_CHARS_MAX);
+
+  const capBullet = (b: string): string => {
+    const trimmed = b.trim();
+    if (trimmed.length <= BULLET_CHARS_MAX) return trimmed;
+    return trimmed.slice(0, BULLET_CHARS_MAX - 1) + "\u2026";
+  };
+
+  const blocks: object[] = [];
+  const sorted = [...byProject.entries()].sort((a, b) => b[1].tokens - a[1].tokens);
+
+  for (const [p, v] of sorted) {
+    const name = sanitizeProjectName(p);
+    const header = `\u{2022} \`${name}\` \u2014 ${v.prompts} prompts, ${formatTokenCount(v.tokens)} tokens`;
+
+    const rawBullets = Array.isArray(summaries[p]) ? summaries[p] : [];
+    const bullets = rawBullets
+      .filter((b) => typeof b === "string" && b.trim().length > 0)
+      .slice(0, BULLETS_PER_PROJECT_MAX)
+      .map((b) => `    \u{2022} ${escapeSlackMrkdwn(capBullet(b))}`);
+
+    let text = bullets.length === 0 ? header : `${header}\n${bullets.join("\n")}`;
+    if (text.length > SECTION_CHARS_MAX) {
+      text = text.slice(0, SECTION_CHARS_MAX - 1) + "\u2026";
+    }
+
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text },
+    });
+  }
+
+  return blocks;
 }
 
 /**

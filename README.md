@@ -202,7 +202,7 @@ claude-report status                     # Show session state
 | `report_done` | Shorthand for completion reports |
 | `fetch_feedback` | Fetch manager replies from the Slack thread |
 | `report_usage` | Get daily usage stats and per-project activity snippets |
-| `post_usage_to_slack` | Post usage summary with AI-generated project summaries |
+| `post_usage_to_slack` | Post usage summary with AI-generated per-project bullet lists |
 | `verify_setup` | Run the 9-check setup smoke test |
 | `install_daily_report` | Generate and load the macOS launchd plist |
 | `report_mute` / `report_unmute` | Pause/resume posting |

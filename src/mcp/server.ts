@@ -20,6 +20,7 @@ import {
   formatUsageSlackBlocks,
   getProjectSnippets,
   recomputeUsageTotals,
+  buildProjectBlocks,
   escapeSlackMrkdwn,
 } from "../core/index.js";
 import type {
@@ -490,32 +491,14 @@ server.tool(
       byProject.set(s.project, existing);
     }
 
-    // Build consolidated project lines with stats + bullet lists.
-    // Cap at 10 bullets to match the tool's documented upper bound — protects
-    // against a hallucinated 50-bullet response blowing past Slack's 3000-char
-    // section limit.
-    const MAX_BULLETS_PER_PROJECT = 10;
-    const projectLines = [...byProject.entries()]
-      .sort((a, b) => b[1].tokens - a[1].tokens)
-      .map(([p, v]) => {
-        const header = `\u{2022} \`${p}\` — ${v.prompts} prompts, ${formatTokenCount(v.tokens)} tokens`;
-        const bullets = (summaries[p] || [])
-          .filter((b) => typeof b === "string" && b.trim().length > 0)
-          .slice(0, MAX_BULLETS_PER_PROJECT);
-        if (bullets.length === 0) return header;
-        const bulletLines = bullets
-          .map((b) => `    \u{2022} ${escapeSlackMrkdwn(b.trim())}`)
-          .join("\n");
-        return `${header}\n${bulletLines}`;
-      })
-      .join("\n");
+    const projectBlocks = buildProjectBlocks(byProject, summaries);
 
     const blocks: object[] = [
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `\u{1f4ca} *${safeName}* — Usage Summary (${date})`,
+          text: `\u{1f4ca} *${safeName}* \u2014 Usage Summary (${date})`,
         },
       },
       {
@@ -532,11 +515,9 @@ server.tool(
       { type: "divider" },
       {
         type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `*Projects:*\n${projectLines}`,
-        },
+        text: { type: "mrkdwn", text: "*Projects:*" },
       },
+      ...projectBlocks,
     ];
 
     const text = `\u{1f4ca} ${safeName} — Usage ${date}`;

@@ -149,7 +149,7 @@ claude-report status                     # セッション状態を表示
 | `report_done` | 完了報告のショートカット |
 | `fetch_feedback` | Slack スレッドのマネージャー返信を取得 |
 | `report_usage` | 日次使用量統計とプロジェクト別アクティビティスニペットを取得 |
-| `post_usage_to_slack` | AI 生成のプロジェクトサマリー付き usage レポートを投稿 |
+| `post_usage_to_slack` | AI 生成のプロジェクト別バレットリスト付き usage レポートを投稿 |
 | `report_mute` / `report_unmute` | 投稿の一時停止/再開 |
 
 ## 日次レポートのスケジューリング
