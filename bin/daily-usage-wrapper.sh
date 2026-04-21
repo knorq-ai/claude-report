@@ -37,7 +37,7 @@ fi
 TMP_OUT="$(mktemp -t claude-report-daily.XXXXXX)"
 trap 'rm -f "$TMP_OUT"' EXIT
 
-PROMPT='Call the report_usage MCP tool for today'\''s date (this is an end-of-day report). Read the per-project snippets and write a concise 1-line Japanese summary (だ・である調) per project. Then call post_usage_to_slack with the date and summaries as a JSON object mapping project path to Japanese summary string.
+PROMPT='Call the report_usage MCP tool for today'\''s date (this is an end-of-day report). Read the per-project snippets and write 1-10 Japanese bullet points (だ・である調) per project describing what was done. Match the bullet count to the amount of work — a tiny session may be a single bullet; do not pad with generic filler. Then call post_usage_to_slack with the date and summaries as a JSON object mapping project path to an array of Japanese bullet strings.
 
 Hard constraints:
 - If the report_usage or post_usage_to_slack MCP tools are not available, print exactly the line "FATAL: MCP unavailable" and stop. Do not suggest webhooks, do not propose alternative Slack integrations, do not output summary tables.

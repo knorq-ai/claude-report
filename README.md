@@ -117,7 +117,7 @@ The `/usage` slash command (or `report_usage` MCP tool) parses local Claude Code
 
 - **Token usage stats** — sessions, prompts (excluding internal tool calls), input/output tokens, estimated cost
 - **Per-project breakdown** — prompts and tokens per project with readable project paths
-- **AI-written summaries** — Claude reads commit messages, edited files, and user prompts to write a 1-line Japanese summary per project
+- **AI-written bullet summaries** — Sonnet reads commit messages, edited files, and user prompts to write 1–10 Japanese bullet points per project (bullet count scales to the amount of work; tiny sessions get one line)
 
 Schedule automatic daily posting with `/schedule-usage` or via launchd:
 

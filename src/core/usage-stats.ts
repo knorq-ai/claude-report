@@ -83,8 +83,16 @@ export function getDailyUsage(date: string): DailyUsage {
       if (!statSync(dirPath).isDirectory()) continue;
     } catch { continue; }
 
-    // Project name will be derived per-transcript from the cwd field
-    const fallbackProject = dir;
+    // All transcripts under one `~/.claude/projects/<dir>` slug share the same
+    // cwd — Claude Code writes them that way. So we can safely collapse any
+    // cwd-less sessions in this dir onto the readable project name derived
+    // from a sibling transcript that DID have a cwd. This fixes the dupe-row
+    // bug where the same project rendered under two keys (e.g.
+    // `Projects/claude-report` + `-Users-yuyamorita-Projects-claude-report`)
+    // because extractCwdFromTranscript only scans the first 8KB and some
+    // sessions (e.g. compact-summary starts) push the cwd field past that.
+    const dirSessions: SessionUsage[] = [];
+    let canonicalProject: string | null = null;
 
     let files: string[];
     try {
@@ -101,14 +109,25 @@ export function getDailyUsage(date: string): DailyUsage {
         if (fileDate < date && fileDate < prevDate(date)) continue;
 
         const cwd = extractCwdFromTranscript(filePath);
-        const project = cwd ? projectNameFromPath(cwd) : fallbackProject;
+        if (cwd && !canonicalProject) {
+          canonicalProject = projectNameFromPath(cwd);
+        }
+        const project = cwd ? projectNameFromPath(cwd) : dir;
         const usage = parseTranscript(filePath, date, project);
         if (usage && usage.assistantTurns > 0) {
           if (cwd) usage.cwd = cwd;
-          sessions.push(usage);
+          dirSessions.push(usage);
         }
       } catch { continue; }
     }
+
+    // Fold cwd-less sessions in this dir onto the canonical name.
+    if (canonicalProject) {
+      for (const s of dirSessions) {
+        if (s.project === dir) s.project = canonicalProject;
+      }
+    }
+    sessions.push(...dirSessions);
   }
 
   // Aggregate totals

@@ -186,7 +186,7 @@ async function postStatusUpdate(
 // ---------------------------------------------------------------------------
 
 const server = new McpServer(
-  { name: "claude-report", version: "0.1.5" },
+  { name: "claude-report", version: "0.1.6" },
   { capabilities: { tools: {} } },
 );
 
@@ -379,7 +379,7 @@ server.tool(
 
 server.tool(
   "report_usage",
-  "Get daily token usage stats and per-project activity snippets. After calling this, write a concise 1-line Japanese summary per project describing what was done (だ・である調), then call post_usage_to_slack with the summaries.",
+  "Get daily token usage stats and per-project activity snippets. After calling this, write 1-10 Japanese bullet points per project describing what was done (だ・である調), then call post_usage_to_slack with the bullets.",
   {
     date: z.string().optional().describe("Date to report (YYYY-MM-DD). Defaults to today."),
   },
@@ -432,9 +432,12 @@ server.tool(
       safeSnippets,
       "</untrusted_activity>",
       "",
-      "NEXT STEP: Write a concise 1-line JAPANESE summary (だ・である調) per project describing what was accomplished.",
-      'Then call post_usage_to_slack with: date and summaries as a JSON object like {"Projects/claude-report": "セキュリティ強化とマーケットプレイス対応を実施", "firstlooptechnology/davie": "コードレビューとバグ修正"}',
-      "The tool will handle all formatting (stats, bullets, code spans). You only provide the summary text per project.",
+      "NEXT STEP: Write JAPANESE bullet points (だ・である調) per project describing what was done.",
+      "- Use 1 to 10 bullets per project. Match the bullet count to the actual amount of work — a tiny session may be a single bullet; a busy session can go up to 10.",
+      "- Do NOT pad with generic filler. If only one thing was done, emit one bullet.",
+      "- Each bullet should be a concrete, verifiable action (implemented X / fixed Y / merged PR Z), not a vague hand-wave.",
+      'Then call post_usage_to_slack with: date and summaries as {"Projects/claude-report": ["セキュリティ強化を実施した", "マーケットプレイスへの公開準備を進めた"], "firstlooptechnology/davie": ["コードレビュー対応", "バグ修正PRをマージした"]}',
+      "The tool handles all formatting (stats, bullets, code spans). You only provide the bullet text per project.",
     ].join("\n");
 
     return {
@@ -453,10 +456,10 @@ function formatTokenCount(n: number): string {
 
 server.tool(
   "post_usage_to_slack",
-  "Post the final usage summary with per-project descriptions to Slack. Call report_usage first to get the data. Pass summaries as JSON object mapping project path to Japanese summary string.",
+  "Post the final usage summary with per-project bullet lists to Slack. Call report_usage first to get the data. Pass summaries as JSON object mapping project path to an array of 1-10 Japanese bullet strings (だ・である調).",
   {
     date: z.string().describe("Date being reported (YYYY-MM-DD)"),
-    summaries: z.record(z.string(), z.string()).describe('JSON object: {"project/path": "日本語の要約", ...}. Keys must match project names from report_usage output.'),
+    summaries: z.record(z.string(), z.array(z.string())).describe('JSON object: {"project/path": ["日本語の要約1", "日本語の要約2"], ...}. 1-10 bullets per project. Keys must match project names from report_usage output.'),
   },
   async ({ date, summaries }) => {
     const ctx = resolveContext();
@@ -487,12 +490,23 @@ server.tool(
       byProject.set(s.project, existing);
     }
 
-    // Build consolidated project lines with stats + summaries
+    // Build consolidated project lines with stats + bullet lists.
+    // Cap at 10 bullets to match the tool's documented upper bound — protects
+    // against a hallucinated 50-bullet response blowing past Slack's 3000-char
+    // section limit.
+    const MAX_BULLETS_PER_PROJECT = 10;
     const projectLines = [...byProject.entries()]
       .sort((a, b) => b[1].tokens - a[1].tokens)
       .map(([p, v]) => {
-        const summary = summaries[p] || "";
-        return `\u{2022} \`${p}\` — ${v.prompts} prompts, ${formatTokenCount(v.tokens)} tokens\n  ${escapeSlackMrkdwn(summary)}`;
+        const header = `\u{2022} \`${p}\` — ${v.prompts} prompts, ${formatTokenCount(v.tokens)} tokens`;
+        const bullets = (summaries[p] || [])
+          .filter((b) => typeof b === "string" && b.trim().length > 0)
+          .slice(0, MAX_BULLETS_PER_PROJECT);
+        if (bullets.length === 0) return header;
+        const bulletLines = bullets
+          .map((b) => `    \u{2022} ${escapeSlackMrkdwn(b.trim())}`)
+          .join("\n");
+        return `${header}\n${bulletLines}`;
       })
       .join("\n");
 

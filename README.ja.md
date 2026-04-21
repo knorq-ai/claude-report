@@ -178,7 +178,7 @@ claude-report status                     # セッション状態を表示
     <array>
         <string>/opt/homebrew/bin/claude</string>
         <string>-p</string>
-        <string>Call report_usage for today's date. Write 1-line Japanese summaries per project, then call post_usage_to_slack.</string>
+        <string>Call report_usage for today's date. Write 1-10 Japanese bullet points per project (だ・である調), then call post_usage_to_slack with summaries as {project: [bullet1, ...]}.</string>
         <string>--plugin-dir</string>
         <string>/path/to/claude-report</string>
         <string>--permission-mode</string>
