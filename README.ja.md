@@ -13,6 +13,8 @@ claude-report は Claude Code と連携し、2層の可視性を提供する:
 
 マネージャーが Slack スレッドに返信すると、そのフィードバックは開発者の次の Claude Code セッションに自動的に反映される。
 
+> **対象範囲:** claude-report は **Claude Code (CLI) のみ**を対象とする。Claude デスクトップアプリの Cowork / agent モードはセッションを `~/Library/Application Support/Claude/local-agent-mode-sessions/` 以下に保存し、Claude Code の hook も走らないため、Cowork のアクティビティとトークン使用量はアクティビティログにも日次サマリーにも含まれない。
+
 ## Quick Start
 
 ### 1. Slack App の作成

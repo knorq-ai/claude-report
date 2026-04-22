@@ -13,6 +13,8 @@ claude-report integrates with Claude Code to provide two layers of visibility:
 
 The plugin also surfaces manager feedback: replies on Slack threads are automatically injected into the developer's next Claude Code session.
 
+> **Scope:** claude-report covers **Claude Code (CLI) only**. The Claude desktop app's Cowork / agent mode stores its sessions under `~/Library/Application Support/Claude/local-agent-mode-sessions/` and does not run Claude Code hooks, so Cowork activity and token usage are not included in the activity log or the daily summary.
+
 ## Team Rollout
 
 claude-report is designed to be rolled out to a whole engineering team so every developer's daily activity and 19:00 usage summary land in one shared channel. The flow splits into a one-time setup by a team lead and a ~2-minute install per teammate.
