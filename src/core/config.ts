@@ -101,14 +101,22 @@ const DEFAULT_CONFIG: Config = {
 };
 
 /**
- * Data directory — uses CLAUDE_PLUGIN_DATA if running as a plugin,
- * falls back to ~/.claude-report for standalone CLI usage.
+ * Data directory. Resolution:
+ *   1. CLAUDE_REPORT_DATA_DIR — explicit override (launchd wrapper uses this)
+ *   2. ~/.claude-report/ if it has config.json — the canonical post-migration
+ *      location. `/install-daily-report` migrates here on first run, after
+ *      which the plugin data dir is left empty. Checking for config.json
+ *      (not just the dir) avoids picking an empty ~/.claude-report that was
+ *      auto-created by getStateDir() on a fresh install.
+ *   3. CLAUDE_PLUGIN_DATA — pre-migration / fresh install (plugin manages it)
+ *   4. ~/.claude-report/ — standalone CLI fallback
  * NOTE: State (sessions) intentionally diverges — see getStateDir().
  */
 export function getDataDir(): string {
-  return process.env.CLAUDE_REPORT_DATA_DIR
-    || process.env.CLAUDE_PLUGIN_DATA
-    || join(homedir(), ".claude-report");
+  if (process.env.CLAUDE_REPORT_DATA_DIR) return process.env.CLAUDE_REPORT_DATA_DIR;
+  const userDir = join(homedir(), ".claude-report");
+  if (existsSync(join(userDir, "config.json"))) return userDir;
+  return process.env.CLAUDE_PLUGIN_DATA || userDir;
 }
 
 /**
