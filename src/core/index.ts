@@ -41,8 +41,10 @@ export {
 export { getSecret, setSecret, deleteSecret } from "./keychain.js";
 export { atomicWriteJson, withFileLock } from "./fs-utils.js";
 export { sendWelcomeIfNeeded } from "./welcome.js";
-export { getDailyUsage, formatUsageSlackBlocks, getProjectSnippets, recomputeUsageTotals, buildProjectBlocks } from "./usage-stats.js";
+export { getDailyUsage, formatUsageSlackBlocks, getProjectSnippets, recomputeUsageTotals, buildProjectBlocks, mergeDailyUsages } from "./usage-stats.js";
 export type { DailyUsage, SessionUsage } from "./usage-stats.js";
+export { getCodexDailyUsage } from "./usage-stats-codex.js";
+export type { CodexQuotaSnapshot } from "./usage-stats-codex.js";
 export {
   isUserEnabled,
   enableUser,

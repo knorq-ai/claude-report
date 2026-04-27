@@ -1,6 +1,6 @@
 // src/hooks/user-prompt-submit.ts
-import { existsSync as existsSync6, readFileSync as readFileSync7 } from "fs";
-import { join as join9 } from "path";
+import { existsSync as existsSync7, readFileSync as readFileSync7 } from "fs";
+import { join as join10 } from "path";
 
 // src/core/config.ts
 import { readFileSync, existsSync } from "fs";
@@ -704,10 +704,17 @@ import { join as join7 } from "path";
 import { homedir as homedir2 } from "os";
 var MAX_TRANSCRIPT_BYTES = 200 * 1024 * 1024;
 
-// src/core/registry.ts
-import { existsSync as existsSync5, readFileSync as readFileSync6, mkdirSync as mkdirSync4 } from "fs";
-import { execFileSync as execFileSync4 } from "child_process";
+// src/core/usage-stats-codex.ts
+import { createReadStream, existsSync as existsSync5, statSync as statSync3 } from "fs";
+import { readdir } from "fs/promises";
+import { createInterface } from "readline";
 import { join as join8 } from "path";
+import { homedir as homedir3 } from "os";
+
+// src/core/registry.ts
+import { existsSync as existsSync6, readFileSync as readFileSync6, mkdirSync as mkdirSync4 } from "fs";
+import { execFileSync as execFileSync4 } from "child_process";
+import { join as join9 } from "path";
 
 // src/core/index.ts
 function createFetcher(config) {
@@ -727,7 +734,7 @@ function createFetcher(config) {
 var CACHE_TTL_MS = 3e5;
 var FETCH_TIMEOUT_MS2 = 2e3;
 function readLastCheckTimestamp(cacheFile) {
-  if (!existsSync6(cacheFile)) return null;
+  if (!existsSync7(cacheFile)) return null;
   try {
     const data = JSON.parse(readFileSync7(cacheFile, "utf-8"));
     return data.checkedAt ?? null;
@@ -768,7 +775,7 @@ async function main() {
   if (!session?.threadId) return;
   const threadId = session.threadId;
   const stateDir = getStateDir();
-  const cacheFile = join9(stateDir, "last-reply-check.json");
+  const cacheFile = join10(stateDir, "last-reply-check.json");
   const lastCheck = readLastCheckTimestamp(cacheFile);
   if (lastCheck !== null && Date.now() - lastCheck < CACHE_TTL_MS) {
     return;

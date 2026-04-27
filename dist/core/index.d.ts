@@ -366,6 +366,8 @@ interface SessionUsage {
     /** Absolute cwd at session start, when recoverable from the transcript. */
     cwd?: string;
     model: string;
+    /** Which CLI produced the session. Defaults to claude-code for back-compat. */
+    source?: "claude-code" | "codex";
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens: number;
@@ -394,11 +396,34 @@ interface DailyUsage {
     estimatedCostUsd: number;
     /** Aggregated key activities across all sessions */
     activities: Activity[];
+    /**
+     * Latest Codex quota snapshot when Codex sessions are merged in.
+     * Codex is subscription-based — there's no per-token cost, so we surface
+     * the rate-limit telemetry instead. Untyped here to avoid a circular
+     * import; the concrete type lives in usage-stats-codex.ts.
+     */
+    codexQuota?: {
+        planType: string;
+        primaryPct: number | null;
+        secondaryPct: number | null;
+        capturedAt: string;
+    };
 }
 /**
  * Scan all transcript files and aggregate usage for a given date.
  */
 declare function getDailyUsage(date: string): DailyUsage;
+/**
+ * Combine a Claude Code DailyUsage with a Codex DailyUsage. Sessions are
+ * concatenated (each side already carries its own `source` discriminator),
+ * activities are interleaved by timestamp, and totals are recomputed via
+ * `recomputeUsageTotals` so cost stays Claude-only (Codex sessions price
+ * to $0 because no model match exists).
+ *
+ * The Codex quota snapshot from `b` wins when both sides happen to have one,
+ * but in practice only the Codex side ever populates it.
+ */
+declare function mergeDailyUsages(a: DailyUsage, b: DailyUsage): DailyUsage;
 /**
  * Recompute `totals` AND `estimatedCostUsd` from `usage.sessions`.
  * Call after mutating `usage.sessions` (e.g. filtering out opted-out projects)
@@ -430,6 +455,41 @@ declare function buildProjectBlocks(byProject: Map<string, {
  * Designed to be passed to Claude for summary generation.
  */
 declare function getProjectSnippets(usage: DailyUsage): string;
+
+/**
+ * Parse Codex CLI session JSONL files to aggregate token usage.
+ *
+ * Codex stores sessions at:
+ *   ~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl
+ * One line per event. Schema is unversioned and shifts across CLI releases —
+ * the parser tolerates unknown event types and missing fields.
+ *
+ * Differences from the Claude Code parser (src/core/usage-stats.ts):
+ *   - Tokens come from `event_msg.token_count.info.total_token_usage` which is
+ *     CUMULATIVE per session and sometimes repeats on no-op snapshots. We sum
+ *     `max(0, total_now - total_prev)` instead of summing `last_token_usage`.
+ *   - Cost: Codex uses subscription quota (`rate_limits.primary.used_percent`,
+ *     `plan_type`), not per-token billing — `estimatedCostUsd` is always 0.
+ *     The latest `rate_limits` snapshot bubbles up via `getCodexQuota`.
+ *   - Sessions can span days and resumed sessions append to their original
+ *     file, so we cannot key on date directories alone — we walk the whole
+ *     tree and filter events by entry timestamp.
+ */
+
+interface CodexQuotaSnapshot {
+    /** "plus", "pro", "free", etc. — verbatim from rate_limits.plan_type. */
+    planType: string;
+    /** rate_limits.primary.used_percent (rolling 5h window typically). */
+    primaryPct: number | null;
+    /** rate_limits.secondary.used_percent (rolling weekly window typically). */
+    secondaryPct: number | null;
+    /** ISO timestamp of the snapshot — latest seen across all sessions. */
+    capturedAt: string;
+}
+/**
+ * Walk all Codex sessions and aggregate usage for `date` (local TZ).
+ */
+declare function getCodexDailyUsage(date: string): Promise<DailyUsage>;
 
 /** Get the git user name for the current directory */
 declare function getGitUser(): string | null;
@@ -465,4 +525,4 @@ declare function createPoster(config: Config, projectDir?: string): StatusPoster
  */
 declare function createFetcher(config: Config): ReplyFetcher | null;
 
-export { type Config, ContentFilter, type DailyUsage, DirectSlackFetcher, DirectSlackPoster, DryRunPoster, JsonFileStore, type PostResult, type RateLimitConfig, type RateLimitResult, RateLimiter, RelayFetcher, RelayPoster, type Reply, type ReplyFetcher, type Session, type SessionUsage, type StatusPoster, type StatusUpdate, type Store, type UpdateMetadata, type UpdateType, atomicWriteJson, buildProjectBlocks, createFetcher, createPoster, deleteSecret, disableUser, enableUser, escapeSlackMrkdwn, formatDailyParent, formatPlainText, formatSlackBlocks, formatUsageSlackBlocks, getConfigDir, getDailyUsage, getGitEmail, getGitUser, getLogDir, getOrCreateSession, getProjectSnippets, getSecret, getStateDir, isProjectDisabled, isUserEnabled, listEnabledUsers, loadConfig, readCurrentSession, readSessionForProject, recomputeUsageTotals, resolveProjectName, resolveUserId, sendWelcomeIfNeeded, setSecret, tokenSimilarity, updateSession, updateSessionForProject, withFileLock };
+export { type CodexQuotaSnapshot, type Config, ContentFilter, type DailyUsage, DirectSlackFetcher, DirectSlackPoster, DryRunPoster, JsonFileStore, type PostResult, type RateLimitConfig, type RateLimitResult, RateLimiter, RelayFetcher, RelayPoster, type Reply, type ReplyFetcher, type Session, type SessionUsage, type StatusPoster, type StatusUpdate, type Store, type UpdateMetadata, type UpdateType, atomicWriteJson, buildProjectBlocks, createFetcher, createPoster, deleteSecret, disableUser, enableUser, escapeSlackMrkdwn, formatDailyParent, formatPlainText, formatSlackBlocks, formatUsageSlackBlocks, getCodexDailyUsage, getConfigDir, getDailyUsage, getGitEmail, getGitUser, getLogDir, getOrCreateSession, getProjectSnippets, getSecret, getStateDir, isProjectDisabled, isUserEnabled, listEnabledUsers, loadConfig, mergeDailyUsages, readCurrentSession, readSessionForProject, recomputeUsageTotals, resolveProjectName, resolveUserId, sendWelcomeIfNeeded, setSecret, tokenSimilarity, updateSession, updateSessionForProject, withFileLock };

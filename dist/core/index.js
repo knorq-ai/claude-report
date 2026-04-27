@@ -1484,6 +1484,7 @@ function getDailyUsage(date) {
     totals.cacheWriteTokens += s.cacheWriteTokens;
     totals.userMessages += s.userMessages;
     totals.assistantTurns += s.assistantTurns;
+    if (s.source === "codex") continue;
     const pricing = findPricing(s.model);
     estimatedCostUsd += s.inputTokens / 1e6 * pricing.input + s.outputTokens / 1e6 * pricing.output + s.cacheReadTokens / 1e6 * pricing.cacheRead + s.cacheWriteTokens / 1e6 * pricing.cacheWrite;
   }
@@ -1685,6 +1686,28 @@ function prevDate(date) {
   dt.setDate(dt.getDate() - 1);
   return localDateString(dt);
 }
+function mergeDailyUsages(a, b) {
+  const merged = {
+    date: a.date,
+    sessions: [...a.sessions, ...b.sessions],
+    totals: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      userMessages: 0,
+      assistantTurns: 0,
+      sessionCount: 0
+    },
+    estimatedCostUsd: 0,
+    activities: [...a.activities, ...b.activities].sort(
+      (x, y) => x.time.localeCompare(y.time)
+    ),
+    codexQuota: b.codexQuota ?? a.codexQuota
+  };
+  recomputeUsageTotals(merged);
+  return merged;
+}
 function recomputeUsageTotals(usage) {
   const t = usage.totals;
   t.inputTokens = 0;
@@ -1702,6 +1725,7 @@ function recomputeUsageTotals(usage) {
     t.cacheWriteTokens += s.cacheWriteTokens;
     t.userMessages += s.userMessages;
     t.assistantTurns += s.assistantTurns;
+    if (s.source === "codex") continue;
     const p = findPricing(s.model);
     cost += s.inputTokens / 1e6 * p.input + s.outputTokens / 1e6 * p.output + s.cacheReadTokens / 1e6 * p.cacheRead + s.cacheWriteTokens / 1e6 * p.cacheWrite;
   }
@@ -1848,16 +1872,331 @@ function getProjectSnippets(usage) {
   return sections.join("\n\n");
 }
 
-// src/core/registry.ts
-import { existsSync as existsSync5, readFileSync as readFileSync6, mkdirSync as mkdirSync4 } from "fs";
-import { execFileSync as execFileSync4 } from "child_process";
+// src/core/usage-stats-codex.ts
+import { createReadStream, existsSync as existsSync5, statSync as statSync3 } from "fs";
+import { readdir } from "fs/promises";
+import { createInterface } from "readline";
 import { join as join8 } from "path";
+import { homedir as homedir3 } from "os";
+function getCodexSessionsRoot() {
+  return join8(homedir3(), ".codex", "sessions");
+}
+async function collectCodexSessionFiles(root, date) {
+  const cutoff = prevDate2(date);
+  const out = [];
+  async function walk(dir) {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = join8(dir, e.name);
+      if (e.isDirectory()) {
+        await walk(p);
+      } else if (e.isFile() && e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) {
+        try {
+          const st = statSync3(p);
+          if (localDateString2(st.mtime) >= cutoff) out.push(p);
+        } catch {
+        }
+      }
+    }
+  }
+  await walk(root);
+  return out;
+}
+async function getCodexDailyUsage(date) {
+  const root = getCodexSessionsRoot();
+  if (!existsSync5(root)) return emptyUsage2(date);
+  const files = await collectCodexSessionFiles(root, date);
+  const sessions = [];
+  let latestQuota = null;
+  for (const file of files) {
+    const result = await parseCodexSession(file, date);
+    if (result.usage) sessions.push(result.usage);
+    if (result.quota && (!latestQuota || result.quota.capturedAt > latestQuota.capturedAt)) {
+      latestQuota = result.quota;
+    }
+  }
+  const totals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    userMessages: 0,
+    assistantTurns: 0,
+    sessionCount: sessions.length
+  };
+  for (const s of sessions) {
+    totals.inputTokens += s.inputTokens;
+    totals.outputTokens += s.outputTokens;
+    totals.cacheReadTokens += s.cacheReadTokens;
+    totals.cacheWriteTokens += s.cacheWriteTokens;
+    totals.userMessages += s.userMessages;
+    totals.assistantTurns += s.assistantTurns;
+  }
+  const activities = sessions.flatMap((s) => s.activities).sort((a, b) => a.time.localeCompare(b.time));
+  return {
+    date,
+    sessions,
+    totals,
+    estimatedCostUsd: 0,
+    activities,
+    codexQuota: latestQuota ?? void 0
+  };
+}
+async function parseCodexSession(filePath, date) {
+  const sessionId = filePath.split("/").pop()?.replace(".jsonl", "") || "unknown";
+  let cwd;
+  let model = "codex";
+  let cliVersion = "";
+  let startedAt = "";
+  let lastActiveAt = "";
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let userMessages = 0;
+  let assistantTurns = 0;
+  const activities = [];
+  let prevTotal = 0;
+  let prevInput = 0;
+  let prevOutput = 0;
+  let prevCacheRead = 0;
+  let latestQuota = null;
+  const stream = createReadStream(filePath, { encoding: "utf-8" });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      if (!line) continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const ts = entry.timestamp;
+      const entryDate = ts ? localDateString2(new Date(ts)) : null;
+      if (entry.type === "session_meta" && entry.payload) {
+        if (!cwd && typeof entry.payload.cwd === "string") cwd = entry.payload.cwd;
+        if (typeof entry.payload.model_provider === "string") {
+          model = entry.payload.model_provider;
+        }
+        if (typeof entry.payload.cli_version === "string") {
+          cliVersion = entry.payload.cli_version;
+        }
+        continue;
+      }
+      if (entry.type === "turn_context" && entry.payload) {
+        if (typeof entry.payload.cwd === "string") cwd = entry.payload.cwd;
+        if (typeof entry.payload.model === "string") model = entry.payload.model;
+        continue;
+      }
+      if (entryDate !== date) continue;
+      if (entry.type === "event_msg" && entry.payload) {
+        const sub = entry.payload.type;
+        if (sub === "user_message") {
+          userMessages++;
+          if (!startedAt) startedAt = ts || "";
+          lastActiveAt = ts || lastActiveAt;
+          const text = typeof entry.payload.message === "string" ? entry.payload.message : "";
+          const promptText = sanitizePromptLine(text);
+          if (promptText && activities.filter((a) => a.type === "prompt").length < 10) {
+            activities.push({ type: "prompt", text: promptText, time: ts || "" });
+          }
+          continue;
+        }
+        if (sub === "exec_command_end") {
+          const cmdArr = entry.payload.command;
+          const cmdText = Array.isArray(cmdArr) ? cmdArr.join(" ") : "";
+          if (cmdText) extractBashActivities2(cmdText, activities, ts || "");
+          lastActiveAt = ts || lastActiveAt;
+          continue;
+        }
+        if (sub === "patch_apply_end") {
+          const files = extractPatchFiles(entry.payload);
+          for (const f of files) {
+            activities.push({ type: "edit", text: f, time: ts || "" });
+          }
+          lastActiveAt = ts || lastActiveAt;
+          continue;
+        }
+        if (sub === "task_complete") {
+          assistantTurns++;
+          lastActiveAt = ts || lastActiveAt;
+          continue;
+        }
+        if (sub === "token_count") {
+          const info = entry.payload.info;
+          if (info && typeof info.total_token_usage === "object" && info.total_token_usage) {
+            const t = info.total_token_usage;
+            const totalNow = numField(t.total_tokens);
+            const inputNow = numField(t.input_tokens);
+            const outputNow = numField(t.output_tokens);
+            const cachedNow = numField(t.cached_input_tokens);
+            if (totalNow > prevTotal) {
+              inputTokens += Math.max(0, inputNow - prevInput);
+              outputTokens += Math.max(0, outputNow - prevOutput);
+              cacheReadTokens += Math.max(0, cachedNow - prevCacheRead);
+              prevTotal = totalNow;
+              prevInput = inputNow;
+              prevOutput = outputNow;
+              prevCacheRead = cachedNow;
+              if (!startedAt) startedAt = ts || "";
+              lastActiveAt = ts || lastActiveAt;
+            }
+          }
+          const rl2 = entry.payload.rate_limits;
+          if (rl2 && ts) {
+            const snapshot = {
+              planType: typeof rl2.plan_type === "string" ? rl2.plan_type : "unknown",
+              primaryPct: pctField(rl2.primary?.used_percent),
+              secondaryPct: pctField(rl2.secondary?.used_percent),
+              capturedAt: ts
+            };
+            if (!latestQuota || snapshot.capturedAt > latestQuota.capturedAt) {
+              latestQuota = snapshot;
+            }
+          }
+          continue;
+        }
+      }
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+  if (assistantTurns === 0 && userMessages === 0 && inputTokens === 0 && outputTokens === 0) {
+    return { usage: null, quota: latestQuota };
+  }
+  const project = cwd ? projectNameFromPath2(cwd) : "codex/unknown";
+  return {
+    usage: {
+      sessionId: sessionId.slice(-12),
+      // Codex IDs are long; tail is more recognizable
+      project,
+      cwd,
+      model: cliVersion ? `codex/${cliVersion}` : "codex",
+      source: "codex",
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheWriteTokens: 0,
+      // Codex telemetry doesn't expose cache-creation
+      userMessages,
+      assistantTurns,
+      startedAt,
+      lastActiveAt,
+      activities
+    },
+    quota: latestQuota
+  };
+}
+function numField(v) {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+function pctField(v) {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+function sanitizePromptLine(text) {
+  if (!text) return null;
+  const firstLine = text.split("\n")[0].trim();
+  if (!firstLine || firstLine.length < 5) return null;
+  if (firstLine.startsWith("<") || firstLine.startsWith("{")) return null;
+  return firstLine.slice(0, 120);
+}
+function extractPatchFiles(payload) {
+  const out = /* @__PURE__ */ new Set();
+  const candidates = [];
+  if (Array.isArray(payload?.changes)) candidates.push(...payload.changes);
+  if (Array.isArray(payload?.files)) candidates.push(...payload.files);
+  if (Array.isArray(payload?.patches)) candidates.push(...payload.patches);
+  for (const c of candidates) {
+    if (typeof c === "string") out.add(c);
+    else if (typeof c?.path === "string") out.add(c.path);
+    else if (typeof c?.file === "string") out.add(c.file);
+  }
+  return [...out];
+}
+function extractBashActivities2(cmd, activities, ts) {
+  if (/git\s+commit/.test(cmd) && /-m/.test(cmd)) {
+    let msg = "";
+    const heredoc = cmd.match(/cat\s+<<'?EOF'?\n([\s\S]*?)\nEOF/);
+    if (heredoc) {
+      const lines = heredoc[1].trim().split("\n");
+      msg = lines[0];
+      if (lines.length > 1 && lines[1].trim()) msg += " \u2014 " + lines[1].trim();
+    } else {
+      const simple = cmd.match(/-m\s+['"](.+?)['"]/);
+      if (simple) msg = simple[1];
+    }
+    msg = msg.slice(0, 150);
+    if (msg) activities.push({ type: "commit", text: msg, time: ts });
+    return;
+  }
+  if (/\bgit\s+push\b/.test(cmd) && !/--dry-run/.test(cmd)) {
+    const m = cmd.match(/git\s+push\s+\S+\s+(\S+)/);
+    activities.push({ type: "push", text: `Pushed to ${m ? m[1] : "branch"}`, time: ts });
+    return;
+  }
+  if (/\bgh\s+pr\s+create\b/.test(cmd)) {
+    const m = cmd.match(/--title\s+['"](.+?)['"]/);
+    activities.push({ type: "pr", text: `PR: ${m ? m[1] : "new PR"}`, time: ts });
+    return;
+  }
+  if (/\b(npm\s+test|npx\s+vitest|npx\s+jest|pytest|cargo\s+test|go\s+test)\b/.test(cmd)) {
+    activities.push({ type: "test", text: "Ran tests", time: ts });
+  }
+}
+function localDateString2(d) {
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+function prevDate2(date) {
+  const [y, m, d] = date.split("-").map((s) => Number.parseInt(s, 10));
+  if (!y || !m || !d) return date;
+  const dt = new Date(y, m - 1, d);
+  dt.setDate(dt.getDate() - 1);
+  return localDateString2(dt);
+}
+function projectNameFromPath2(cwd) {
+  const home = homedir3();
+  const relative = cwd.startsWith(home) ? cwd.slice(home.length + 1) : cwd;
+  const segments = relative.split("/").filter(Boolean);
+  if (segments.length <= 2) return segments.join("/") || cwd;
+  return segments.slice(-2).join("/");
+}
+function emptyUsage2(date) {
+  return {
+    date,
+    sessions: [],
+    totals: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      userMessages: 0,
+      assistantTurns: 0,
+      sessionCount: 0
+    },
+    estimatedCostUsd: 0,
+    activities: []
+  };
+}
+
+// src/core/registry.ts
+import { existsSync as existsSync6, readFileSync as readFileSync6, mkdirSync as mkdirSync4 } from "fs";
+import { execFileSync as execFileSync4 } from "child_process";
+import { join as join9 } from "path";
 function registryPath() {
-  return join8(getConfigDir(), "registry.json");
+  return join9(getConfigDir(), "registry.json");
 }
 function loadRegistry() {
   const file = registryPath();
-  if (!existsSync5(file)) return { enabledUsers: [] };
+  if (!existsSync6(file)) return { enabledUsers: [] };
   try {
     return JSON.parse(readFileSync6(file, "utf-8"));
   } catch {
@@ -1980,6 +2319,7 @@ export {
   formatPlainText,
   formatSlackBlocks,
   formatUsageSlackBlocks,
+  getCodexDailyUsage,
   getConfigDir,
   getDailyUsage,
   getGitEmail,
@@ -1993,6 +2333,7 @@ export {
   isUserEnabled,
   listEnabledUsers,
   loadConfig,
+  mergeDailyUsages,
   readCurrentSession,
   readSessionForProject,
   recomputeUsageTotals,

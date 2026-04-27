@@ -828,15 +828,22 @@ import { join as join7 } from "path";
 import { homedir as homedir2 } from "os";
 var MAX_TRANSCRIPT_BYTES = 200 * 1024 * 1024;
 
-// src/core/registry.ts
-import { existsSync as existsSync5, readFileSync as readFileSync6, mkdirSync as mkdirSync4 } from "fs";
-import { execFileSync as execFileSync4 } from "child_process";
+// src/core/usage-stats-codex.ts
+import { createReadStream, existsSync as existsSync5, statSync as statSync3 } from "fs";
+import { readdir } from "fs/promises";
+import { createInterface } from "readline";
 import { join as join8 } from "path";
+import { homedir as homedir3 } from "os";
+
+// src/core/registry.ts
+import { existsSync as existsSync6, readFileSync as readFileSync6, mkdirSync as mkdirSync4 } from "fs";
+import { execFileSync as execFileSync4 } from "child_process";
+import { join as join9 } from "path";
 
 // src/hooks/post-tool-use.ts
 import { appendFile as appendFile2, mkdir as mkdir2 } from "fs/promises";
-import { join as join9 } from "path";
-import { existsSync as existsSync6, readFileSync as readFileSync7, writeFileSync as writeFileSync2 } from "fs";
+import { join as join10 } from "path";
+import { existsSync as existsSync7, readFileSync as readFileSync7, writeFileSync as writeFileSync2 } from "fs";
 import { createHash as createHash3 } from "crypto";
 async function slackPost(token, body) {
   const res = await fetch("https://slack.com/api/chat.postMessage", {
@@ -984,11 +991,11 @@ var EVENT_ICONS = {
 };
 var TASK_CACHE_MAX_ENTRIES = 200;
 function taskCachePath() {
-  return join9(getStateDir(), "task-subjects.json");
+  return join10(getStateDir(), "task-subjects.json");
 }
 function readTaskCache() {
   const path = taskCachePath();
-  if (!existsSync6(path)) return {};
+  if (!existsSync7(path)) return {};
   try {
     const parsed = JSON.parse(readFileSync7(path, "utf-8"));
     return typeof parsed === "object" && parsed !== null ? parsed : {};
@@ -1131,7 +1138,7 @@ async function main() {
       const logDir = getLogDir();
       await mkdir2(logDir, { recursive: true });
       await appendFile2(
-        join9(logDir, "dry-run.log"),
+        join10(logDir, "dry-run.log"),
         `[${(/* @__PURE__ */ new Date()).toISOString()}] ${logText}
 `,
         "utf-8"
@@ -1295,7 +1302,7 @@ function releaseClaim(userId, myClaim) {
 }
 function writeSessionFieldsInLock(userId, updates) {
   const path = sessionFilePathFor(userId);
-  if (!existsSync6(path)) return;
+  if (!existsSync7(path)) return;
   try {
     const session = JSON.parse(readFileSync7(path, "utf-8"));
     Object.assign(session, updates, { lastActiveAt: (/* @__PURE__ */ new Date()).toISOString() });
@@ -1305,11 +1312,11 @@ function writeSessionFieldsInLock(userId, updates) {
 }
 function sessionFilePathFor(userId) {
   const hash = createHash3("sha256").update(`${userId}:activity-log`).digest("hex").slice(0, 12);
-  return join9(getStateDir(), `session-${hash}.json`);
+  return join10(getStateDir(), `session-${hash}.json`);
 }
 function readSessionJson(userId) {
   const filePath = sessionFilePathFor(userId);
-  if (!existsSync6(filePath)) return null;
+  if (!existsSync7(filePath)) return null;
   try {
     return JSON.parse(readFileSync7(filePath, "utf-8"));
   } catch {

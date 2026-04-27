@@ -20,6 +20,8 @@ export interface SessionUsage {
   /** Absolute cwd at session start, when recoverable from the transcript. */
   cwd?: string;
   model: string;
+  /** Which CLI produced the session. Defaults to claude-code for back-compat. */
+  source?: "claude-code" | "codex";
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
@@ -49,6 +51,18 @@ export interface DailyUsage {
   estimatedCostUsd: number;
   /** Aggregated key activities across all sessions */
   activities: Activity[];
+  /**
+   * Latest Codex quota snapshot when Codex sessions are merged in.
+   * Codex is subscription-based — there's no per-token cost, so we surface
+   * the rate-limit telemetry instead. Untyped here to avoid a circular
+   * import; the concrete type lives in usage-stats-codex.ts.
+   */
+  codexQuota?: {
+    planType: string;
+    primaryPct: number | null;
+    secondaryPct: number | null;
+    capturedAt: string;
+  };
 }
 
 // Approximate pricing (public rates, may change)
@@ -153,6 +167,9 @@ export function getDailyUsage(date: string): DailyUsage {
     totals.cacheWriteTokens += s.cacheWriteTokens;
     totals.userMessages += s.userMessages;
     totals.assistantTurns += s.assistantTurns;
+
+    // Codex bills via subscription quota, not per-token — exclude from $ cost.
+    if (s.source === "codex") continue;
 
     const pricing = findPricing(s.model);
     estimatedCostUsd +=
@@ -419,6 +436,39 @@ function prevDate(date: string): string {
 }
 
 /**
+ * Combine a Claude Code DailyUsage with a Codex DailyUsage. Sessions are
+ * concatenated (each side already carries its own `source` discriminator),
+ * activities are interleaved by timestamp, and totals are recomputed via
+ * `recomputeUsageTotals` so cost stays Claude-only (Codex sessions price
+ * to $0 because no model match exists).
+ *
+ * The Codex quota snapshot from `b` wins when both sides happen to have one,
+ * but in practice only the Codex side ever populates it.
+ */
+export function mergeDailyUsages(a: DailyUsage, b: DailyUsage): DailyUsage {
+  const merged: DailyUsage = {
+    date: a.date,
+    sessions: [...a.sessions, ...b.sessions],
+    totals: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      userMessages: 0,
+      assistantTurns: 0,
+      sessionCount: 0,
+    },
+    estimatedCostUsd: 0,
+    activities: [...a.activities, ...b.activities].sort((x, y) =>
+      x.time.localeCompare(y.time),
+    ),
+    codexQuota: b.codexQuota ?? a.codexQuota,
+  };
+  recomputeUsageTotals(merged);
+  return merged;
+}
+
+/**
  * Recompute `totals` AND `estimatedCostUsd` from `usage.sessions`.
  * Call after mutating `usage.sessions` (e.g. filtering out opted-out projects)
  * so the header stats and cost stay in sync with the per-project breakdown.
@@ -436,6 +486,7 @@ export function recomputeUsageTotals(usage: DailyUsage): void {
     t.cacheWriteTokens += s.cacheWriteTokens;
     t.userMessages += s.userMessages;
     t.assistantTurns += s.assistantTurns;
+    if (s.source === "codex") continue; // subscription-quota — see getDailyUsage()
     const p = findPricing(s.model);
     cost += (s.inputTokens / 1_000_000) * p.input
           + (s.outputTokens / 1_000_000) * p.output

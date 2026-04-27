@@ -1,6 +1,6 @@
 {
   "name": "claude-report",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Automatic dev status updates from Claude Code to Slack. Gives managers real-time visibility without interrupting developers.",
   "author": {
     "name": "Yuya Morita"
