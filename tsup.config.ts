@@ -39,4 +39,14 @@ export default defineConfig([
     splitting: false,
     noExternal: [],
   },
+  // Codex watcher daemon — long-lived process, no shebang (run via wrapper).
+  {
+    entry: { "codex-watcher/index": "src/codex-watcher/index.ts" },
+    format: ["esm"],
+    dts: true,
+    sourcemap: true,
+    clean: false,
+    target: "node20",
+    splitting: false,
+  },
 ]);

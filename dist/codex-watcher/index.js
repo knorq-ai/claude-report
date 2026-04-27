@@ -1,3 +1,9 @@
+// src/codex-watcher/index.ts
+import { readFileSync as readFileSync8, statSync as statSync4, openSync as openSync2, readSync as readSync2, closeSync as closeSync2, existsSync as existsSync8, mkdirSync as mkdirSync5 } from "fs";
+import { readdir as readdir2 } from "fs/promises";
+import { join as join11 } from "path";
+import { homedir as homedir4 } from "os";
+
 // src/core/config.ts
 import { readFileSync, existsSync } from "fs";
 import { execFileSync } from "child_process";
@@ -71,9 +77,6 @@ function getStateDir() {
   const explicit = process.env.CLAUDE_REPORT_DATA_DIR;
   if (explicit) return join(explicit, "state");
   return join(homedir(), ".claude-report", "state");
-}
-function getLogDir() {
-  return join(getDataDir(), "logs");
 }
 function getConfigDir() {
   return getDataDir();
@@ -763,64 +766,6 @@ import { existsSync as existsSync4 } from "fs";
 import { join as join6 } from "path";
 import slackPkg3 from "@slack/web-api";
 var { WebClient: WebClient3 } = slackPkg3;
-var MARKER_FILE = "welcome-sent.json";
-async function sendWelcomeIfNeeded(config) {
-  const markerPath = join6(getDataDir(), MARKER_FILE);
-  if (existsSync4(markerPath)) return;
-  if (!config.slack.botToken || !config.slack.channel) return;
-  let claim;
-  try {
-    claim = withFileLock(markerPath, () => {
-      if (existsSync4(markerPath)) return "already_sent";
-      atomicWriteJson(markerPath, { sentAt: null, userName: null, pending: true });
-      return "claimed";
-    });
-  } catch (err) {
-    if (err instanceof LockTimeoutError) return;
-    throw err;
-  }
-  if (claim === "already_sent") return;
-  const userName = config.user.name || "Someone";
-  const safeName = escapeSlackMrkdwn(userName);
-  const client = new WebClient3(config.slack.botToken, { timeout: 5e3 });
-  try {
-    await client.chat.postMessage({
-      channel: config.slack.channel,
-      text: `\u{1F44B} ${safeName} started using claude-report`,
-      blocks: [
-        {
-          type: "section",
-          text: {
-            type: "mrkdwn",
-            text: `\u{1F44B} *${safeName}* started using claude-report`
-          }
-        },
-        {
-          type: "context",
-          elements: [
-            {
-              type: "mrkdwn",
-              text: "Dev status updates will appear in this channel automatically."
-            }
-          ]
-        }
-      ]
-    });
-    atomicWriteJson(markerPath, {
-      sentAt: (/* @__PURE__ */ new Date()).toISOString(),
-      userName
-    });
-  } catch (err) {
-    try {
-      const { unlinkSync: unlinkSync2 } = await import("fs");
-      unlinkSync2(markerPath);
-    } catch {
-    }
-    console.error(
-      `[claude-report] welcome message failed: ${err instanceof Error ? err.message : err}`
-    );
-  }
-}
 
 // src/core/usage-stats.ts
 import { readdirSync as readdirSync2, readFileSync as readFileSync5, statSync as statSync2, openSync, readSync, closeSync } from "fs";
@@ -1021,11 +966,6 @@ var ACTIVITY_EVENT_ICONS = {
   // pencil
 };
 
-// src/hooks/post-tool-use.ts
-import { appendFile as appendFile2, mkdir as mkdir2 } from "fs/promises";
-import { join as join11 } from "path";
-import { existsSync as existsSync8, readFileSync as readFileSync8, writeFileSync as writeFileSync2 } from "fs";
-
 // src/core/bash-event-detector.ts
 function detectBashEvent(command, output) {
   if (/\bgit\s+push\b/.test(command) && !/--dry-run/.test(command)) {
@@ -1096,266 +1036,288 @@ function isTestCommand(command) {
   return /\b(npm\s+test|npx\s+vitest|npx\s+jest|pytest|go\s+test|cargo\s+test|make\s+test|yarn\s+test|pnpm\s+test)\b/.test(command);
 }
 
-// src/hooks/post-tool-use.ts
-var MAX_OUTPUT_SCAN_BYTES = 32 * 1024;
-function getToolOutput(input) {
-  const raw = input.tool_output || input.tool_response || "";
-  const merged = mergeRaw(raw);
-  return merged.length > MAX_OUTPUT_SCAN_BYTES ? merged.slice(0, MAX_OUTPUT_SCAN_BYTES) : merged;
+// src/codex-watcher/index.ts
+import { fileURLToPath } from "url";
+var MAX_READ_BYTES_PER_TICK = 4 * 1024 * 1024;
+var PRUNE_EVERY_N_TICKS = 150;
+function watermarkPath() {
+  return join11(getStateDir(), "codex-watermarks.json");
 }
-function mergeRaw(raw) {
-  if (typeof raw === "string") return raw;
-  if (typeof raw === "object" && raw !== null) {
-    const obj = raw;
-    const stdout = typeof obj.stdout === "string" ? obj.stdout : "";
-    const stderr = typeof obj.stderr === "string" ? obj.stderr : "";
-    return stdout && stderr ? `${stdout}
-${stderr}` : stdout || stderr;
-  }
-  return "";
-}
-function detectTaskEvent(input, output, rawResponse, taskSubjectLookup) {
-  if (input.status === "completed" && input.taskId) {
-    const parsed = parseTaskOutput(output);
-    const resp = typeof rawResponse === "object" && rawResponse !== null ? rawResponse : void 0;
-    const subject = input.subject || parsed.subject || (typeof resp?.subject === "string" ? resp.subject : void 0) || taskSubjectLookup?.(String(input.taskId)) || `#${input.taskId}`;
-    const details = parsed.description || (typeof resp?.description === "string" ? resp.description : void 0);
-    return {
-      type: "completion",
-      summary: `Task completed: ${subject}`,
-      details
-    };
-  }
-  return null;
-}
-function parseTaskOutput(output) {
-  if (!output) return {};
+function loadWatermarks() {
+  const path = watermarkPath();
+  if (!existsSync8(path)) return { files: {} };
   try {
-    const data = JSON.parse(output);
-    return {
-      subject: data.subject || void 0,
-      description: data.description || void 0
-    };
-  } catch {
-  }
-  const subject = output.match(/subject[:\s]+"([^"]+)"/i)?.[1] || output.match(/subject[:\s]+(.+)/im)?.[1]?.trim();
-  const description = output.match(/description[:\s]+"([^"]+)"/i)?.[1] || output.match(/description[:\s]+(.+)/im)?.[1]?.trim();
-  return { subject: subject || void 0, description: description || void 0 };
-}
-var EVENT_ICONS = ACTIVITY_EVENT_ICONS;
-var TASK_CACHE_MAX_ENTRIES = 200;
-function taskCachePath() {
-  return join11(getStateDir(), "task-subjects.json");
-}
-function readTaskCache() {
-  const path = taskCachePath();
-  if (!existsSync8(path)) return {};
-  try {
-    const parsed = JSON.parse(readFileSync8(path, "utf-8"));
-    return typeof parsed === "object" && parsed !== null ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-function writeTaskCache(cache) {
-  const path = taskCachePath();
-  try {
-    withFileLock(path, () => {
-      const keys = Object.keys(cache);
-      if (keys.length > TASK_CACHE_MAX_ENTRIES) {
-        const trimmed = {};
-        for (const k of keys.slice(-TASK_CACHE_MAX_ENTRIES)) trimmed[k] = cache[k];
-        cache = trimmed;
+    const data = JSON.parse(readFileSync8(path, "utf-8"));
+    if (data && typeof data === "object" && data.files && typeof data.files === "object") {
+      for (const wm of Object.values(data.files)) {
+        if (wm && typeof wm === "object" && typeof wm.partialLine === "string" && !wm.partialBase64) {
+          wm.partialBase64 = Buffer.from(wm.partialLine, "utf-8").toString("base64");
+          delete wm.partialLine;
+        }
+        if (wm && typeof wm === "object" && typeof wm.partialBase64 !== "string") {
+          wm.partialBase64 = "";
+        }
       }
-      const path2 = taskCachePath();
-      writeFileSync2(path2, JSON.stringify(cache, null, 2), "utf-8");
-    });
+      return data;
+    }
   } catch {
   }
+  return { files: {} };
 }
-function lookupTaskSubject(taskId) {
-  return readTaskCache()[taskId];
-}
-function cacheTaskSubject(taskId, subject) {
-  const cache = readTaskCache();
-  cache[taskId] = subject;
-  writeTaskCache(cache);
-}
-function extractTaskCreateSubject(toolInput, rawResponse, outputText) {
-  if (typeof rawResponse === "object" && rawResponse !== null) {
-    const resp = rawResponse;
-    if (resp.task && typeof resp.task === "object") {
-      const t = resp.task;
-      if (typeof t.id === "string" && typeof t.subject === "string") {
-        return { taskId: t.id, subject: t.subject };
-      }
-    }
-    if (typeof resp.subject === "string" && typeof resp.taskId === "string") {
-      return { taskId: resp.taskId, subject: resp.subject };
-    }
-  }
-  const textMatch = outputText.match(/Task\s+#(\S+)\s+created\s+successfully:\s*(.+)$/m);
-  if (textMatch) {
-    return { taskId: textMatch[1], subject: textMatch[2].trim() };
-  }
-  if (typeof toolInput?.subject === "string" && toolInput.taskId) {
-    return { taskId: String(toolInput.taskId), subject: toolInput.subject };
-  }
-  return null;
-}
-async function readStdinWithTimeout(timeoutMs) {
-  const chunks = [];
-  const timer = setTimeout(() => {
-    process.stdin.pause();
-  }, timeoutMs);
+function saveWatermarks(store) {
+  const path = watermarkPath();
   try {
-    for await (const chunk of process.stdin) {
-      chunks.push(chunk);
-    }
-  } finally {
-    clearTimeout(timer);
-  }
-  return Buffer.concat(chunks).toString("utf-8");
-}
-async function main() {
-  const STDIN_TIMEOUT_MS = 2e3;
-  const raw = await readStdinWithTimeout(STDIN_TIMEOUT_MS);
-  if (!raw) return;
-  let input;
-  try {
-    input = JSON.parse(raw);
-  } catch {
-    process.stderr.write(`[claude-report] invalid hook input (${raw.length} bytes)
+    mkdirSync5(getStateDir(), { recursive: true });
+    atomicWriteJson(path, store);
+  } catch (err) {
+    process.stderr.write(`[codex-watcher] watermark write failed: ${err instanceof Error ? err.message : err}
 `);
-    return;
   }
-  if (!input.tool_name) return;
-  const output = getToolOutput(input);
-  let event = null;
-  if (input.tool_name === "Bash") {
-    const command = input.tool_input?.command || "";
-    event = detectBashEvent(command, output);
-  } else if (input.tool_name === "TaskCreate") {
-    const extracted = extractTaskCreateSubject(input.tool_input || {}, input.tool_response, output);
-    if (extracted) {
-      cacheTaskSubject(extracted.taskId, extracted.subject);
+}
+function getCodexSessionsRoot() {
+  return join11(homedir4(), ".codex", "sessions");
+}
+async function collectSessionFiles(root) {
+  const out = [];
+  async function walk(dir) {
+    let entries;
+    try {
+      entries = await readdir2(dir, { withFileTypes: true });
+    } catch {
+      return;
     }
-    return;
-  } else if (input.tool_name === "TaskUpdate") {
-    event = detectTaskEvent(
-      input.tool_input,
-      output,
-      input.tool_response,
-      lookupTaskSubject
-    );
+    for (const e of entries) {
+      const p = join11(dir, e.name);
+      if (e.isDirectory()) {
+        await walk(p);
+      } else if (e.isFile() && e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) {
+        out.push(p);
+      }
+    }
   }
-  if (!event) return;
-  const projectDir = input.cwd || process.cwd();
-  const config = loadConfig(projectDir);
+  await walk(root);
+  return out;
+}
+function readBytesFrom(file, from, len) {
+  if (len <= 0) return Buffer.alloc(0);
+  const fd = openSync2(file, "r");
+  try {
+    const buf = Buffer.alloc(len);
+    const n = readSync2(fd, buf, 0, len, from);
+    return n === len ? buf : buf.subarray(0, n);
+  } finally {
+    try {
+      closeSync2(fd);
+    } catch {
+    }
+  }
+}
+function eventFromCodexLine(entry) {
+  if (entry?.type !== "event_msg" || !entry.payload) return null;
+  const sub = entry.payload.type;
+  const ts = typeof entry.timestamp === "string" ? entry.timestamp : void 0;
+  if (sub === "exec_command_end") {
+    const cmd = Array.isArray(entry.payload.command) ? entry.payload.command.join(" ") : "";
+    const output = typeof entry.payload.aggregated_output === "string" ? entry.payload.aggregated_output : `${entry.payload.stdout ?? ""}
+${entry.payload.stderr ?? ""}`;
+    if (!cmd) return null;
+    const event = detectBashEvent(cmd, output);
+    if (!event) return null;
+    return {
+      event,
+      ctx: {
+        cwd: typeof entry.payload.cwd === "string" ? entry.payload.cwd : void 0,
+        ts,
+        sessionId: typeof entry.payload.turn_id === "string" ? entry.payload.turn_id : ""
+      }
+    };
+  }
+  return null;
+}
+async function postEventToSlack(detected, ctx) {
+  const config = loadConfig(ctx.cwd);
   if (!config.notifications.enabled) return;
-  if (isProjectDisabled(projectDir)) return;
-  if (event.type === "push" && config.notifications.onGitPush === false) return;
-  if (event.type === "blocker" && config.notifications.onBlocker === false) return;
-  if (event.type === "completion" && config.notifications.onCompletion === false) return;
-  const project = resolveProjectName(projectDir);
+  if (ctx.cwd && isProjectDisabled(ctx.cwd)) return;
+  if (detected.type === "push" && config.notifications.onGitPush === false) return;
+  if (detected.type === "blocker" && config.notifications.onBlocker === false) return;
+  if (detected.type === "completion" && config.notifications.onCompletion === false) return;
+  if (!config.slack.botToken || !config.slack.channel) return;
+  const project = ctx.cwd ? resolveProjectName(ctx.cwd) : "codex/unknown";
   const userId = resolveUserId(config);
   const userName = config.user.name || "Unknown";
   const session = getOrCreateSession(userId, "activity-log");
   if (session.muted) return;
-  const contentFilter = new ContentFilter();
+  const filter = new ContentFilter();
   const update = {
-    type: event.type,
-    summary: event.summary,
-    details: event.details,
+    type: detected.type,
+    summary: detected.summary,
+    details: detected.details,
     timestamp: /* @__PURE__ */ new Date(),
     userId,
     sessionId: session.sessionId,
     project,
-    metadata: event.metadata
+    metadata: detected.metadata
   };
-  const filtered = contentFilter.filter(update);
+  const filtered = filter.filter(update);
   const rateLimiter = new RateLimiter(config.rateLimit);
   const rate = rateLimiter.shouldPost(filtered, session);
-  if (!rate.allowed) {
-    return;
-  }
-  const icon = EVENT_ICONS[event.type] || "\u{1F535}";
+  if (!rate.allowed) return;
+  const today = localDateStr();
+  const threadId = await acquireThreadId(
+    userId,
+    session.threadId,
+    config.slack.botToken,
+    config.slack.channel,
+    escapeSlackMrkdwn(userName),
+    today
+  );
+  if (!threadId) return;
+  const icon = ACTIVITY_EVENT_ICONS[detected.type] || "\u{1F535}";
   const safeProject = escapeSlackMrkdwn(project).replace(/`/g, "'");
   const safeSummary = escapeSlackMrkdwn(filtered.summary);
-  let logText = `\`${safeProject}\` ${icon} ${safeSummary}`;
-  if (filtered.details) {
-    logText += `
+  let logText = `\u{1F916} \`${safeProject}\` ${icon} ${safeSummary}`;
+  if (filtered.details) logText += `
   ${escapeSlackMrkdwn(filtered.details)}`;
-  }
-  if (config.notifications.dryRun) {
-    try {
-      const logDir = getLogDir();
-      await mkdir2(logDir, { recursive: true });
-      await appendFile2(
-        join11(logDir, "dry-run.log"),
-        `[${(/* @__PURE__ */ new Date()).toISOString()}] ${logText}
-`,
-        "utf-8"
-      );
-    } catch (err) {
-      process.stderr.write(`[claude-report] dry-run write failed: ${err instanceof Error ? err.message : err}
+  const reply = await slackPost(config.slack.botToken, {
+    channel: config.slack.channel,
+    thread_ts: threadId,
+    text: logText
+  });
+  if (!reply.ok) {
+    process.stderr.write(`[codex-watcher] reply failed: ${JSON.stringify(reply).slice(0, 200)}
 `);
-    }
-    rateLimiter.recordPost(filtered);
-    const today = localDateStr();
-    updateSessionForProject(userId, "activity-log", {
-      lastPostAt: (/* @__PURE__ */ new Date()).toISOString(),
-      lastPostSummary: filtered.summary,
-      postCount: session.postCount + 1,
-      dailyPostCount: session.dailyPostDate === today ? session.dailyPostCount + 1 : 1,
-      dailyPostDate: today
-    });
     return;
   }
-  if (!config.slack.botToken || !config.slack.channel) return;
-  await sendWelcomeIfNeeded(config);
+  rateLimiter.recordPost(filtered);
+  updateSessionForProject(userId, "activity-log", {
+    lastPostAt: (/* @__PURE__ */ new Date()).toISOString(),
+    lastPostSummary: filtered.summary,
+    postCount: session.postCount + 1,
+    dailyPostCount: session.dailyPostDate === today ? session.dailyPostCount + 1 : 1,
+    dailyPostDate: today
+  });
+}
+async function processFile(file, prev) {
+  let size;
   try {
-    const today = localDateStr();
-    const threadId = await acquireThreadId(
-      userId,
-      session.threadId,
-      config.slack.botToken,
-      config.slack.channel,
-      escapeSlackMrkdwn(userName),
-      today
-    );
-    if (!threadId) return;
-    const reply = await slackPost(config.slack.botToken, {
-      channel: config.slack.channel,
-      thread_ts: threadId,
-      text: logText
-    });
-    if (!reply.ok) {
-      process.stderr.write(`[claude-report] reply failed: ${JSON.stringify(reply).slice(0, 200)}
+    size = statSync4(file).size;
+  } catch {
+    return prev ?? { bytesRead: 0, lastSeenAt: (/* @__PURE__ */ new Date()).toISOString(), partialBase64: "" };
+  }
+  if (!prev) {
+    return {
+      bytesRead: size,
+      lastSeenAt: (/* @__PURE__ */ new Date()).toISOString(),
+      partialBase64: ""
+    };
+  }
+  if (size < prev.bytesRead) {
+    prev = { bytesRead: 0, lastSeenAt: prev.lastSeenAt, partialBase64: "" };
+  }
+  if (size === prev.bytesRead && !prev.partialBase64) {
+    return prev;
+  }
+  const remaining = size - prev.bytesRead;
+  const readLen = Math.min(remaining, MAX_READ_BYTES_PER_TICK);
+  const newBytes = readBytesFrom(file, prev.bytesRead, readLen);
+  const partialBuf = prev.partialBase64 ? Buffer.from(prev.partialBase64, "base64") : Buffer.alloc(0);
+  const combined = Buffer.concat([partialBuf, newBytes]);
+  const lastNl = combined.lastIndexOf(10);
+  let advancedBytes = readLen;
+  let nextPartial;
+  let completePart;
+  if (lastNl === -1) {
+    completePart = Buffer.alloc(0);
+    nextPartial = combined;
+  } else {
+    completePart = combined.subarray(0, lastNl);
+    nextPartial = combined.subarray(lastNl + 1);
+  }
+  if (lastNl === -1 && remaining > MAX_READ_BYTES_PER_TICK) {
+    nextPartial = Buffer.alloc(0);
+  }
+  if (completePart.length > 0) {
+    const text = completePart.toString("utf-8");
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const detected = eventFromCodexLine(entry);
+      if (detected) {
+        try {
+          await postEventToSlack(detected.event, detected.ctx);
+        } catch (err) {
+          process.stderr.write(`[codex-watcher] post error: ${err instanceof Error ? err.message : err}
 `);
-      return;
+        }
+      }
     }
-    rateLimiter.recordPost(filtered);
-    updateSessionForProject(userId, "activity-log", {
-      lastPostAt: (/* @__PURE__ */ new Date()).toISOString(),
-      lastPostSummary: filtered.summary,
-      postCount: session.postCount + 1,
-      dailyPostCount: session.dailyPostDate === today ? session.dailyPostCount + 1 : 1,
-      dailyPostDate: today
-    });
-  } catch (err) {
-    process.stderr.write(`[claude-report] log failed: ${err instanceof Error ? err.message : err}
-`);
+  }
+  return {
+    bytesRead: prev.bytesRead + advancedBytes,
+    lastSeenAt: (/* @__PURE__ */ new Date()).toISOString(),
+    partialBase64: nextPartial.length > 0 ? nextPartial.toString("base64") : ""
+  };
+}
+function pruneStaleWatermarks(store, maxAgeDays = 14) {
+  const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1e3;
+  for (const [path, wm] of Object.entries(store.files)) {
+    const t = new Date(wm.lastSeenAt).getTime();
+    if (Number.isFinite(t) && t < cutoff) delete store.files[path];
   }
 }
-main().catch((err) => {
-  process.stderr.write(`[claude-report] hook error: ${err instanceof Error ? err.message : err}
+async function tick(store) {
+  const root = getCodexSessionsRoot();
+  if (!existsSync8(root)) return;
+  const files = await collectSessionFiles(root);
+  for (const file of files) {
+    const next = await processFile(file, store.files[file]);
+    store.files[file] = next;
+  }
+}
+var TICK_INTERVAL_MS = 2e3;
+async function run() {
+  process.stderr.write(`[codex-watcher] starting (pid ${process.pid})
 `);
-}).finally(() => process.exit(0));
+  const store = loadWatermarks();
+  pruneStaleWatermarks(store);
+  let stopRequested = false;
+  const shutdown = (sig) => {
+    process.stderr.write(`[codex-watcher] ${sig} received, shutting down
+`);
+    stopRequested = true;
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  let tickN = 0;
+  while (!stopRequested) {
+    try {
+      await tick(store);
+      if (++tickN % PRUNE_EVERY_N_TICKS === 0) pruneStaleWatermarks(store);
+      saveWatermarks(store);
+    } catch (err) {
+      process.stderr.write(`[codex-watcher] tick error: ${err instanceof Error ? err.stack : err}
+`);
+    }
+    await new Promise((r) => setTimeout(r, TICK_INTERVAL_MS));
+  }
+  saveWatermarks(store);
+  process.stderr.write(`[codex-watcher] stopped
+`);
+}
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1] === fileURLToPath(import.meta.url)) {
+  run().catch((err) => {
+    process.stderr.write(`[codex-watcher] fatal: ${err instanceof Error ? err.stack : err}
+`);
+    process.exit(1);
+  });
+}
 export {
-  detectBashEvent,
-  detectTaskEvent,
-  getToolOutput,
-  parseTaskOutput
+  eventFromCodexLine,
+  run
 };
-//# sourceMappingURL=post-tool-use.js.map
+//# sourceMappingURL=index.js.map

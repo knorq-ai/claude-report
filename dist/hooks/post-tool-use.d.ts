@@ -10,12 +10,28 @@ interface UpdateMetadata {
 }
 
 /**
+ * Pure detector for git push / commit / PR / test-failure events from a
+ * shell command + its output. Shared between the Claude Code PostToolUse
+ * hook and the Codex watcher daemon.
+ *
+ * No side effects on import — safe for the long-lived watcher to import.
+ * Extracted from src/hooks/post-tool-use.ts unchanged.
+ */
+
+interface DetectedEvent {
+    type: UpdateType;
+    summary: string;
+    details?: string;
+    metadata?: UpdateMetadata;
+}
+declare function detectBashEvent(command: string, output: string): DetectedEvent | null;
+
+/**
  * Claude Code hook: PostToolUse
  *
  * Deterministic event detection — fires on Bash and TaskUpdate tool calls.
  * Detects: git push, git commit, gh pr create, test failures, task completion.
  */
-
 interface HookInput {
     tool_name: string;
     tool_input: Record<string, any>;
@@ -32,13 +48,7 @@ interface HookInput {
 }
 /** Get tool output from hook input — handles both field names and structured responses. */
 declare function getToolOutput(input: HookInput): string;
-interface DetectedEvent {
-    type: UpdateType;
-    summary: string;
-    details?: string;
-    metadata?: UpdateMetadata;
-}
-declare function detectBashEvent(command: string, output: string): DetectedEvent | null;
+
 declare function detectTaskEvent(input: Record<string, any>, output: string, rawResponse?: unknown, taskSubjectLookup?: (taskId: string) => string | undefined): DetectedEvent | null;
 /** Extract task subject and description from tool_output text */
 declare function parseTaskOutput(output: string): {

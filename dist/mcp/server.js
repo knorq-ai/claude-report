@@ -2688,6 +2688,133 @@ ${envXml}
     return { content: [{ type: "text", text: outLines.join("\n") }] };
   }
 );
+server.tool(
+  "install_codex_watcher",
+  "Install (or refresh) the macOS launchd job that runs the Codex watcher daemon. The watcher tails ~/.codex/sessions/**/rollout-*.jsonl and posts real-time activity-log events (git push/commit/PR/test failure) into the same daily Slack thread as the Claude Code hook. Idempotent \u2014 safe to re-run after a plugin update.",
+  {},
+  async () => {
+    const { spawnSync } = await import("child_process");
+    const { writeFileSync: writeFileSync2, mkdirSync: mkdirSync5, existsSync: existsSync7, readFileSync: readFileSync7 } = await import("fs");
+    const { homedir: homedir4, platform: platform2 } = await import("os");
+    const { join: join10, dirname: dirname2 } = await import("path");
+    if (platform2() !== "darwin") {
+      return {
+        content: [{
+          type: "text",
+          text: "install_codex_watcher currently only supports macOS (launchd). On Linux, run `dist/codex-watcher/index.js` from a systemd service with Restart=always."
+        }]
+      };
+    }
+    const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || process.env.CLAUDE_REPORT_PLUGIN_DIR;
+    if (!pluginRoot) {
+      return {
+        content: [{ type: "text", text: "Cannot resolve plugin root. Call this tool from a Claude Code plugin session so CLAUDE_PLUGIN_ROOT is set." }]
+      };
+    }
+    const wrapperPath = join10(pluginRoot, "bin", "codex-watcher-wrapper.sh");
+    const watcherJs = join10(pluginRoot, "dist", "codex-watcher", "index.js");
+    if (!existsSync7(wrapperPath)) {
+      return { content: [{ type: "text", text: `Wrapper not found at ${wrapperPath}. Reinstall the plugin.` }] };
+    }
+    if (!existsSync7(watcherJs)) {
+      return { content: [{ type: "text", text: `Watcher build missing at ${watcherJs}. Run \`npm run build\` in ${pluginRoot} first.` }] };
+    }
+    const which = spawnSync("bash", ["-lc", "command -v node"], { encoding: "utf-8" });
+    const nodeBin = which.status === 0 ? (which.stdout || "").trim() : "";
+    const durableDataDir = join10(homedir4(), ".claude-report");
+    mkdirSync5(durableDataDir, { recursive: true });
+    const logDir = join10(durableDataDir, "logs");
+    mkdirSync5(logDir, { recursive: true });
+    const label = "com.claude-report.codex-watcher";
+    const plistPath = join10(homedir4(), "Library", "LaunchAgents", `${label}.plist`);
+    mkdirSync5(dirname2(plistPath), { recursive: true });
+    let backupPath = null;
+    if (existsSync7(plistPath)) {
+      try {
+        const existing = readFileSync7(plistPath, "utf-8");
+        backupPath = `${plistPath}.bak.${Date.now()}`;
+        writeFileSync2(backupPath, existing, "utf-8");
+      } catch {
+        backupPath = null;
+      }
+    }
+    const envEntries = [
+      ["PATH", `${nodeBin ? dirname2(nodeBin) + ":" : ""}/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin`],
+      ["HOME", homedir4()],
+      ["CLAUDE_REPORT_PLUGIN_DIR", pluginRoot],
+      ["CLAUDE_REPORT_DATA_DIR", durableDataDir]
+    ];
+    if (nodeBin) envEntries.push(["NODE_BIN", nodeBin]);
+    const xmlEscape = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+    const envXml = envEntries.map(([k, v]) => `        <key>${xmlEscape(k)}</key>
+        <string>${xmlEscape(v)}</string>`).join("\n");
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${xmlEscape(wrapperPath)}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${xmlEscape(pluginRoot)}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>${xmlEscape(join10(logDir, "codex-watcher-stdout.log"))}</string>
+    <key>StandardErrorPath</key>
+    <string>${xmlEscape(join10(logDir, "codex-watcher-stderr.log"))}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+${envXml}
+    </dict>
+</dict>
+</plist>
+`;
+    writeFileSync2(plistPath, plist, "utf-8");
+    const uid = process.getuid ? process.getuid() : null;
+    if (uid === null) {
+      return {
+        content: [{ type: "text", text: `Wrote plist to ${plistPath} but could not determine UID; load manually with \`launchctl bootstrap gui/$(id -u) ${plistPath}\`.` }]
+      };
+    }
+    spawnSync("launchctl", ["bootout", `gui/${uid}`, plistPath], { stdio: "pipe" });
+    const bootstrap = spawnSync("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "pipe", encoding: "utf-8" });
+    if (bootstrap.status !== 0) {
+      const stderr = (bootstrap.stderr || "").trim() || `exit ${bootstrap.status}`;
+      return {
+        content: [{ type: "text", text: `Wrote plist to ${plistPath} but launchctl bootstrap failed: ${stderr}` }]
+      };
+    }
+    const outLines = [
+      `\u2705 Codex watcher daemon scheduled.`,
+      ``,
+      `- plist:        ${plistPath}`,
+      `- wrapper:      ${wrapperPath}`,
+      `- watcher:      ${watcherJs}`,
+      `- node bin:     ${nodeBin || "(resolved from PATH at run time)"}`,
+      `- plugin root:  ${pluginRoot}`,
+      `- data dir:     ${durableDataDir} (pinned via CLAUDE_REPORT_DATA_DIR)`,
+      `- logs:         ${logDir}/codex-watcher-{stdout,stderr}.log`,
+      `- KeepAlive:    on (launchd restarts on crash, throttled to 10s)`
+    ];
+    if (backupPath) outLines.push(`- backup:       ${backupPath} (previous plist)`);
+    outLines.push(
+      ``,
+      `The watcher tails ~/.codex/sessions/**/rollout-*.jsonl on a 2-second tick.`,
+      `On first start it skips historical events to avoid replaying old sessions \u2014`,
+      `only new bytes appended after install will be reported to Slack.`
+    );
+    return { content: [{ type: "text", text: outLines.join("\n") }] };
+  }
+);
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);

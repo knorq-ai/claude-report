@@ -2281,23 +2281,15 @@ var init_core = __esm({
   }
 });
 
-// src/hooks/post-tool-use.ts
-var post_tool_use_exports = {};
-__export(post_tool_use_exports, {
-  detectBashEvent: () => detectBashEvent,
-  detectTaskEvent: () => detectTaskEvent,
-  getToolOutput: () => getToolOutput,
-  parseTaskOutput: () => parseTaskOutput
-});
-import { appendFile as appendFile2, mkdir as mkdir2 } from "fs/promises";
+// src/core/activity-thread.ts
+import { existsSync as existsSync7, readFileSync as readFileSync7 } from "fs";
 import { join as join10 } from "path";
-import { existsSync as existsSync7, readFileSync as readFileSync7, writeFileSync as writeFileSync2 } from "fs";
 import { createHash as createHash3 } from "crypto";
 async function slackPost(token, body) {
   const res = await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${token}`,
+      Authorization: `Bearer ${token}`,
       "Content-Type": "application/json"
     },
     body: JSON.stringify(body),
@@ -2309,22 +2301,178 @@ function localDateStr() {
   const d = /* @__PURE__ */ new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
-function getToolOutput(input) {
-  const raw = input.tool_output || input.tool_response || "";
-  const merged = mergeRaw(raw);
-  return merged.length > MAX_OUTPUT_SCAN_BYTES ? merged.slice(0, MAX_OUTPUT_SCAN_BYTES) : merged;
+function makeClaim() {
+  return `${CLAIM_PREFIX}:${process.pid}:${Date.now()}`;
 }
-function mergeRaw(raw) {
-  if (typeof raw === "string") return raw;
-  if (typeof raw === "object" && raw !== null) {
-    const obj = raw;
-    const stdout = typeof obj.stdout === "string" ? obj.stdout : "";
-    const stderr = typeof obj.stderr === "string" ? obj.stderr : "";
-    return stdout && stderr ? `${stdout}
-${stderr}` : stdout || stderr;
+function parseClaim(threadId) {
+  if (!threadId || !threadId.startsWith(CLAIM_PREFIX)) return null;
+  const parts = threadId.split(":");
+  if (parts.length !== 3) return { stale: true };
+  const pid = Number.parseInt(parts[1], 10);
+  const ts = Number.parseInt(parts[2], 10);
+  if (!Number.isFinite(pid) || !Number.isFinite(ts)) return { stale: true };
+  const ageMs = Date.now() - ts;
+  if (ageMs < 0 || ageMs > CLAIM_STALE_MS) return { stale: true };
+  try {
+    process.kill(pid, 0);
+    return { stale: false };
+  } catch (err) {
+    if (err?.code === "ESRCH") return { stale: true };
+    return { stale: false };
   }
-  return "";
 }
+function sessionFilePathFor(userId) {
+  const hash = createHash3("sha256").update(`${userId}:activity-log`).digest("hex").slice(0, 12);
+  return join10(getStateDir(), `session-${hash}.json`);
+}
+function readSessionJson(userId) {
+  const filePath = sessionFilePathFor(userId);
+  if (!existsSync7(filePath)) return null;
+  try {
+    return JSON.parse(readFileSync7(filePath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+function writeSessionFieldsInLock(userId, updates) {
+  const path = sessionFilePathFor(userId);
+  if (!existsSync7(path)) return;
+  try {
+    const session = JSON.parse(readFileSync7(path, "utf-8"));
+    Object.assign(session, updates, { lastActiveAt: (/* @__PURE__ */ new Date()).toISOString() });
+    atomicWriteJson(path, session);
+  } catch {
+  }
+}
+function releaseClaim(userId, myClaim) {
+  try {
+    withFileLock(sessionFilePathFor(userId), () => {
+      const cur = readSessionJson(userId);
+      if (cur?.threadId === myClaim) {
+        writeSessionFieldsInLock(userId, { threadId: null });
+      }
+    });
+  } catch {
+  }
+}
+async function acquireThreadId(userId, existingThreadId, botToken, channel, safeUserName, today) {
+  const fresh = readSessionJson(userId);
+  if (fresh?.dailyPostDate && fresh.dailyPostDate !== today) {
+    existingThreadId = null;
+  }
+  if (existingThreadId && parseClaim(existingThreadId) === null) return existingThreadId;
+  const myClaim = makeClaim();
+  const claim = withFileLock(
+    sessionFilePathFor(userId),
+    () => {
+      const cur = readSessionJson(userId);
+      if (!cur) return { state: "claimed" };
+      if (cur.dailyPostDate && cur.dailyPostDate !== today) {
+        const claimInfo2 = parseClaim(cur.threadId);
+        if (claimInfo2 === null || claimInfo2.stale) {
+          writeSessionFieldsInLock(userId, { threadId: myClaim });
+          return { state: "claimed" };
+        }
+        return { state: "wait" };
+      }
+      const claimInfo = parseClaim(cur.threadId);
+      if (cur.threadId && claimInfo === null) {
+        return { state: "reuse", existing: cur.threadId };
+      }
+      if (claimInfo && !claimInfo.stale) {
+        return { state: "wait" };
+      }
+      writeSessionFieldsInLock(userId, { threadId: myClaim });
+      return { state: "claimed" };
+    }
+  );
+  if (claim.state === "reuse") return claim.existing;
+  if (claim.state === "wait") {
+    const WAIT_POLL_MS = 150;
+    const WAIT_MAX_ATTEMPTS = 20;
+    for (let i = 0; i < WAIT_MAX_ATTEMPTS; i++) {
+      await new Promise((r) => setTimeout(r, WAIT_POLL_MS));
+      const cur2 = readSessionJson(userId);
+      if (!cur2) continue;
+      const info = parseClaim(cur2.threadId);
+      if (cur2.threadId && info === null) return cur2.threadId;
+      if (info && info.stale) {
+        const stolen = withFileLock(sessionFilePathFor(userId), () => {
+          const latest = readSessionJson(userId);
+          const latestInfo = parseClaim(latest?.threadId ?? null);
+          if (latestInfo && latestInfo.stale) {
+            writeSessionFieldsInLock(userId, { threadId: myClaim });
+            return true;
+          }
+          return false;
+        });
+        if (stolen) break;
+      }
+    }
+    const cur = readSessionJson(userId);
+    if (cur?.threadId !== myClaim) {
+      const info = parseClaim(cur?.threadId ?? null);
+      if (cur?.threadId && info === null) return cur.threadId;
+      return null;
+    }
+  }
+  try {
+    const parent = await slackPost(botToken, {
+      channel,
+      text: `\u{1F4CB} ${safeUserName} \u2014 ${today}`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `\u{1F4CB} *${safeUserName}* \u2014 Activity Log (${today})`
+          }
+        }
+      ]
+    });
+    if (!parent.ts) {
+      releaseClaim(userId, myClaim);
+      process.stderr.write(`[claude-report] parent post returned no ts
+`);
+      return null;
+    }
+    updateSessionForProject(userId, "activity-log", { threadId: parent.ts });
+    return parent.ts;
+  } catch (err) {
+    releaseClaim(userId, myClaim);
+    process.stderr.write(`[claude-report] parent post failed: ${err instanceof Error ? err.message : err}
+`);
+    return null;
+  }
+}
+var CLAIM_PREFIX, CLAIM_STALE_MS, ACTIVITY_EVENT_ICONS;
+var init_activity_thread = __esm({
+  "src/core/activity-thread.ts"() {
+    "use strict";
+    init_fs_utils();
+    init_fs_utils();
+    init_config();
+    init_session();
+    CLAIM_PREFIX = "__claiming__";
+    CLAIM_STALE_MS = 6e4;
+    ACTIVITY_EVENT_ICONS = {
+      push: "\u{1F680}",
+      // rocket
+      status: "\u{1F4DD}",
+      // memo
+      completion: "\u2705",
+      // check
+      blocker: "\u{1F6D1}",
+      // stop
+      pivot: "\u{1F504}",
+      // arrows
+      edit: "\u270F\uFE0F"
+      // pencil
+    };
+  }
+});
+
+// src/core/bash-event-detector.ts
 function detectBashEvent(command, output) {
   if (/\bgit\s+push\b/.test(command) && !/--dry-run/.test(command)) {
     if (/^To\s+/m.test(output)) {
@@ -2368,13 +2516,63 @@ function detectBashEvent(command, output) {
     const failCount = failCountMatch ? Number.parseInt(failCountMatch[1], 10) : 0;
     if (hasExitError || failCount > 0) {
       const summary = failCount > 0 ? `Tests failing: ${failCount} failure${failCount === 1 ? "" : "s"}` : "Tests failing";
-      return {
-        type: "blocker",
-        summary
-      };
+      return { type: "blocker", summary };
     }
   }
   return null;
+}
+function extractBranch(command, output) {
+  const outMatch = output.match(
+    /(?:\[new branch\]|\w+\.\.\w+|\*)\s+\S+\s+->\s+(\S+)/m
+  );
+  if (outMatch) return outMatch[1];
+  const branchQuote = output.match(/branch\s+'([^']+)'/);
+  if (branchQuote) return branchQuote[1];
+  const tokens = command.split(/\s+/).filter((t) => !t.startsWith("-"));
+  const pushIdx = tokens.indexOf("push");
+  if (pushIdx >= 0 && tokens.length > pushIdx + 2) {
+    const refspec = tokens[pushIdx + 2];
+    if (refspec && refspec !== "HEAD") {
+      return refspec.includes(":") ? refspec.split(":").pop() : refspec;
+    }
+  }
+  return "unknown";
+}
+function isTestCommand(command) {
+  return /\b(npm\s+test|npx\s+vitest|npx\s+jest|pytest|go\s+test|cargo\s+test|make\s+test|yarn\s+test|pnpm\s+test)\b/.test(command);
+}
+var init_bash_event_detector = __esm({
+  "src/core/bash-event-detector.ts"() {
+    "use strict";
+  }
+});
+
+// src/hooks/post-tool-use.ts
+var post_tool_use_exports = {};
+__export(post_tool_use_exports, {
+  detectBashEvent: () => detectBashEvent,
+  detectTaskEvent: () => detectTaskEvent,
+  getToolOutput: () => getToolOutput,
+  parseTaskOutput: () => parseTaskOutput
+});
+import { appendFile as appendFile2, mkdir as mkdir2 } from "fs/promises";
+import { join as join11 } from "path";
+import { existsSync as existsSync8, readFileSync as readFileSync8, writeFileSync as writeFileSync2 } from "fs";
+function getToolOutput(input) {
+  const raw = input.tool_output || input.tool_response || "";
+  const merged = mergeRaw(raw);
+  return merged.length > MAX_OUTPUT_SCAN_BYTES ? merged.slice(0, MAX_OUTPUT_SCAN_BYTES) : merged;
+}
+function mergeRaw(raw) {
+  if (typeof raw === "string") return raw;
+  if (typeof raw === "object" && raw !== null) {
+    const obj = raw;
+    const stdout = typeof obj.stdout === "string" ? obj.stdout : "";
+    const stderr = typeof obj.stderr === "string" ? obj.stderr : "";
+    return stdout && stderr ? `${stdout}
+${stderr}` : stdout || stderr;
+  }
+  return "";
 }
 function detectTaskEvent(input, output, rawResponse, taskSubjectLookup) {
   if (input.status === "completed" && input.taskId) {
@@ -2404,34 +2602,14 @@ function parseTaskOutput(output) {
   const description = output.match(/description[:\s]+"([^"]+)"/i)?.[1] || output.match(/description[:\s]+(.+)/im)?.[1]?.trim();
   return { subject: subject || void 0, description: description || void 0 };
 }
-function extractBranch(command, output) {
-  const outMatch = output.match(
-    /(?:\[new branch\]|\w+\.\.\w+|\*)\s+\S+\s+->\s+(\S+)/m
-  );
-  if (outMatch) return outMatch[1];
-  const branchQuote = output.match(/branch\s+'([^']+)'/);
-  if (branchQuote) return branchQuote[1];
-  const tokens = command.split(/\s+/).filter((t) => !t.startsWith("-"));
-  const pushIdx = tokens.indexOf("push");
-  if (pushIdx >= 0 && tokens.length > pushIdx + 2) {
-    const refspec = tokens[pushIdx + 2];
-    if (refspec && refspec !== "HEAD") {
-      return refspec.includes(":") ? refspec.split(":").pop() : refspec;
-    }
-  }
-  return "unknown";
-}
-function isTestCommand(command) {
-  return /\b(npm\s+test|npx\s+vitest|npx\s+jest|pytest|go\s+test|cargo\s+test|make\s+test|yarn\s+test|pnpm\s+test)\b/.test(command);
-}
 function taskCachePath() {
-  return join10(getStateDir(), "task-subjects.json");
+  return join11(getStateDir(), "task-subjects.json");
 }
 function readTaskCache() {
   const path = taskCachePath();
-  if (!existsSync7(path)) return {};
+  if (!existsSync8(path)) return {};
   try {
-    const parsed = JSON.parse(readFileSync7(path, "utf-8"));
+    const parsed = JSON.parse(readFileSync8(path, "utf-8"));
     return typeof parsed === "object" && parsed !== null ? parsed : {};
   } catch {
     return {};
@@ -2572,7 +2750,7 @@ async function main() {
       const logDir = getLogDir();
       await mkdir2(logDir, { recursive: true });
       await appendFile2(
-        join10(logDir, "dry-run.log"),
+        join11(logDir, "dry-run.log"),
         `[${(/* @__PURE__ */ new Date()).toISOString()}] ${logText}
 `,
         "utf-8"
@@ -2628,154 +2806,16 @@ async function main() {
 `);
   }
 }
-function makeClaim() {
-  return `${CLAIM_PREFIX}:${process.pid}:${Date.now()}`;
-}
-function parseClaim(threadId) {
-  if (!threadId || !threadId.startsWith(CLAIM_PREFIX)) return null;
-  const parts = threadId.split(":");
-  if (parts.length !== 3) return { stale: true };
-  const pid = Number.parseInt(parts[1], 10);
-  const ts = Number.parseInt(parts[2], 10);
-  if (!Number.isFinite(pid) || !Number.isFinite(ts)) return { stale: true };
-  const ageMs = Date.now() - ts;
-  if (ageMs < 0 || ageMs > CLAIM_STALE_MS) return { stale: true };
-  try {
-    process.kill(pid, 0);
-    return { stale: false };
-  } catch (err) {
-    if (err?.code === "ESRCH") return { stale: true };
-    return { stale: false };
-  }
-}
-async function acquireThreadId(userId, existingThreadId, botToken, channel, safeUserName, today) {
-  if (existingThreadId && parseClaim(existingThreadId) === null) return existingThreadId;
-  const myClaim = makeClaim();
-  const claim = withFileLock(sessionFilePathFor(userId), () => {
-    const cur = readSessionJson(userId);
-    if (!cur) return { state: "claimed" };
-    const claimInfo = parseClaim(cur.threadId);
-    if (cur.threadId && claimInfo === null) {
-      return { state: "reuse", existing: cur.threadId };
-    }
-    if (claimInfo && !claimInfo.stale) {
-      return { state: "wait" };
-    }
-    writeSessionFieldsInLock(userId, { threadId: myClaim });
-    return { state: "claimed" };
-  });
-  if (claim.state === "reuse") return claim.existing;
-  if (claim.state === "wait") {
-    const WAIT_POLL_MS = 150;
-    const WAIT_MAX_ATTEMPTS = 20;
-    for (let i = 0; i < WAIT_MAX_ATTEMPTS; i++) {
-      await new Promise((r) => setTimeout(r, WAIT_POLL_MS));
-      const cur2 = readSessionJson(userId);
-      if (!cur2) continue;
-      const info = parseClaim(cur2.threadId);
-      if (cur2.threadId && info === null) return cur2.threadId;
-      if (info && info.stale) {
-        const stolen = withFileLock(sessionFilePathFor(userId), () => {
-          const latest = readSessionJson(userId);
-          const latestInfo = parseClaim(latest?.threadId ?? null);
-          if (latestInfo && latestInfo.stale) {
-            writeSessionFieldsInLock(userId, { threadId: myClaim });
-            return true;
-          }
-          return false;
-        });
-        if (stolen) break;
-      }
-    }
-    const cur = readSessionJson(userId);
-    if (cur?.threadId !== myClaim) {
-      const info = parseClaim(cur?.threadId ?? null);
-      if (cur?.threadId && info === null) return cur.threadId;
-      return null;
-    }
-  }
-  try {
-    const parent = await slackPost(botToken, {
-      channel,
-      text: `\u{1F4CB} ${safeUserName} \u2014 ${today}`,
-      blocks: [{
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `\u{1F4CB} *${safeUserName}* \u2014 Activity Log (${today})`
-        }
-      }]
-    });
-    if (!parent.ts) {
-      releaseClaim(userId, myClaim);
-      process.stderr.write(`[claude-report] parent post returned no ts
-`);
-      return null;
-    }
-    updateSessionForProject(userId, "activity-log", { threadId: parent.ts });
-    return parent.ts;
-  } catch (err) {
-    releaseClaim(userId, myClaim);
-    process.stderr.write(`[claude-report] parent post failed: ${err instanceof Error ? err.message : err}
-`);
-    return null;
-  }
-}
-function releaseClaim(userId, myClaim) {
-  try {
-    withFileLock(sessionFilePathFor(userId), () => {
-      const cur = readSessionJson(userId);
-      if (cur?.threadId === myClaim) {
-        writeSessionFieldsInLock(userId, { threadId: null });
-      }
-    });
-  } catch {
-  }
-}
-function writeSessionFieldsInLock(userId, updates) {
-  const path = sessionFilePathFor(userId);
-  if (!existsSync7(path)) return;
-  try {
-    const session = JSON.parse(readFileSync7(path, "utf-8"));
-    Object.assign(session, updates, { lastActiveAt: (/* @__PURE__ */ new Date()).toISOString() });
-    atomicWriteJson(path, session);
-  } catch {
-  }
-}
-function sessionFilePathFor(userId) {
-  const hash = createHash3("sha256").update(`${userId}:activity-log`).digest("hex").slice(0, 12);
-  return join10(getStateDir(), `session-${hash}.json`);
-}
-function readSessionJson(userId) {
-  const filePath = sessionFilePathFor(userId);
-  if (!existsSync7(filePath)) return null;
-  try {
-    return JSON.parse(readFileSync7(filePath, "utf-8"));
-  } catch {
-    return null;
-  }
-}
-var MAX_OUTPUT_SCAN_BYTES, EVENT_ICONS, TASK_CACHE_MAX_ENTRIES, CLAIM_PREFIX, CLAIM_STALE_MS;
+var MAX_OUTPUT_SCAN_BYTES, EVENT_ICONS, TASK_CACHE_MAX_ENTRIES;
 var init_post_tool_use = __esm({
   "src/hooks/post-tool-use.ts"() {
     "use strict";
     init_core();
+    init_activity_thread();
+    init_bash_event_detector();
     MAX_OUTPUT_SCAN_BYTES = 32 * 1024;
-    EVENT_ICONS = {
-      push: "\u{1F680}",
-      // rocket
-      status: "\u{1F4DD}",
-      // memo
-      completion: "\u2705",
-      // check
-      blocker: "\u{1F6D1}",
-      // stop
-      pivot: "\u{1F504}"
-      // arrows
-    };
+    EVENT_ICONS = ACTIVITY_EVENT_ICONS;
     TASK_CACHE_MAX_ENTRIES = 200;
-    CLAIM_PREFIX = "__claiming__";
-    CLAIM_STALE_MS = 6e4;
     main().catch((err) => {
       process.stderr.write(`[claude-report] hook error: ${err instanceof Error ? err.message : err}
 `);
@@ -2785,12 +2825,12 @@ var init_post_tool_use = __esm({
 
 // src/hooks/user-prompt-submit.ts
 var user_prompt_submit_exports = {};
-import { existsSync as existsSync8, readFileSync as readFileSync8 } from "fs";
-import { join as join11 } from "path";
+import { existsSync as existsSync9, readFileSync as readFileSync9 } from "fs";
+import { join as join12 } from "path";
 function readLastCheckTimestamp(cacheFile) {
-  if (!existsSync8(cacheFile)) return null;
+  if (!existsSync9(cacheFile)) return null;
   try {
-    const data = JSON.parse(readFileSync8(cacheFile, "utf-8"));
+    const data = JSON.parse(readFileSync9(cacheFile, "utf-8"));
     return data.checkedAt ?? null;
   } catch {
     return null;
@@ -2829,7 +2869,7 @@ async function main2() {
   if (!session?.threadId) return;
   const threadId = session.threadId;
   const stateDir = getStateDir();
-  const cacheFile = join11(stateDir, "last-reply-check.json");
+  const cacheFile = join12(stateDir, "last-reply-check.json");
   const lastCheck = readLastCheckTimestamp(cacheFile);
   if (lastCheck !== null && Date.now() - lastCheck < CACHE_TTL_MS) {
     return;
@@ -3304,10 +3344,10 @@ ${formatted}`
       "Run a smoke test of the claude-report install. Checks config, Slack auth, channel membership, AND the scheduled path (launchd job loaded, plist present, wrapper executable, dist built, claude resolvable). Safe to run anytime \u2014 the verify message to Slack is clearly marked.",
       {},
       async () => {
-        const { existsSync: existsSync9, statSync: statSync4, accessSync, constants } = await import("fs");
+        const { existsSync: existsSync10, statSync: statSync4, accessSync, constants } = await import("fs");
         const { spawnSync } = await import("child_process");
         const { homedir: homedir4, platform: platform2 } = await import("os");
-        const { join: join12 } = await import("path");
+        const { join: join13 } = await import("path");
         const lines = [];
         const warnings = [];
         const errors = [];
@@ -3326,7 +3366,7 @@ ${formatted}`
         lines.push(`- user name:     ${ctx.config.user.name || "(not set)"}`);
         lines.push(`- slack token:   ${ctx.config.slack.botToken ? "set (" + ctx.config.slack.botToken.slice(0, 8) + "\u2026)" : "MISSING"}`);
         lines.push(`- slack channel: ${ctx.config.slack.channel || "MISSING"}`);
-        lines.push(`- data dir:      ${process.env.CLAUDE_REPORT_DATA_DIR || process.env.CLAUDE_PLUGIN_DATA || join12(homedir4(), ".claude-report")}`);
+        lines.push(`- data dir:      ${process.env.CLAUDE_REPORT_DATA_DIR || process.env.CLAUDE_PLUGIN_DATA || join13(homedir4(), ".claude-report")}`);
         lines.push(`- plugin root:   ${process.env.CLAUDE_PLUGIN_ROOT || "(not set \u2014 verify_setup expects to run inside a plugin session)"}`);
         lines.push(`- project (cwd): ${ctx.project}`);
         lines.push("");
@@ -3370,8 +3410,8 @@ ${formatted}`
         } else {
           const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || process.env.CLAUDE_REPORT_PLUGIN_DIR;
           const label = "com.claude-report.daily-usage";
-          const plistPath = join12(homedir4(), "Library", "LaunchAgents", `${label}.plist`);
-          if (existsSync9(plistPath)) push("plist present", true, plistPath);
+          const plistPath = join13(homedir4(), "Library", "LaunchAgents", `${label}.plist`);
+          if (existsSync10(plistPath)) push("plist present", true, plistPath);
           else push(
             "plist present",
             false,
@@ -3398,8 +3438,8 @@ ${formatted}`
               "run this tool from inside a Claude Code plugin session"
             );
           } else {
-            const wrapper = join12(pluginRoot, "bin", "daily-usage-wrapper.sh");
-            if (!existsSync9(wrapper)) {
+            const wrapper = join13(pluginRoot, "bin", "daily-usage-wrapper.sh");
+            if (!existsSync10(wrapper)) {
               push("wrapper present", false, wrapper, "reinstall the plugin");
             } else {
               try {
@@ -3409,8 +3449,8 @@ ${formatted}`
                 push("wrapper executable", false, `not +x: ${wrapper}`, `chmod +x ${wrapper}`);
               }
             }
-            const distMcp = join12(pluginRoot, "dist", "mcp", "server.js");
-            if (existsSync9(distMcp)) push("dist/mcp/server.js built", true, distMcp);
+            const distMcp = join13(pluginRoot, "dist", "mcp", "server.js");
+            if (existsSync10(distMcp)) push("dist/mcp/server.js built", true, distMcp);
             else push("dist/mcp/server.js built", false, `not found: ${distMcp}`, "run `npm run build` in the plugin root");
           }
           const which = spawnSync("bash", ["-lc", "command -v claude"], { encoding: "utf-8" });
@@ -3447,9 +3487,9 @@ ${formatted}`
       },
       async ({ hour, minute }) => {
         const { spawnSync } = await import("child_process");
-        const { writeFileSync: writeFileSync3, mkdirSync: mkdirSync5, existsSync: existsSync9, copyFileSync, readFileSync: readFileSync9 } = await import("fs");
+        const { writeFileSync: writeFileSync3, mkdirSync: mkdirSync5, existsSync: existsSync10, copyFileSync, readFileSync: readFileSync10 } = await import("fs");
         const { homedir: homedir4, platform: platform2 } = await import("os");
-        const { join: join12, dirname: dirname2 } = await import("path");
+        const { join: join13, dirname: dirname2 } = await import("path");
         if (platform2() !== "darwin") {
           return {
             content: [{
@@ -3464,25 +3504,25 @@ ${formatted}`
             content: [{ type: "text", text: "Cannot resolve plugin root. Call this tool from a Claude Code plugin session so CLAUDE_PLUGIN_ROOT is set." }]
           };
         }
-        const wrapperPath = join12(pluginRoot, "bin", "daily-usage-wrapper.sh");
-        const distMcp = join12(pluginRoot, "dist", "mcp", "server.js");
-        if (!existsSync9(wrapperPath)) {
+        const wrapperPath = join13(pluginRoot, "bin", "daily-usage-wrapper.sh");
+        const distMcp = join13(pluginRoot, "dist", "mcp", "server.js");
+        if (!existsSync10(wrapperPath)) {
           return { content: [{ type: "text", text: `Wrapper not found at ${wrapperPath}. Reinstall the plugin.` }] };
         }
-        if (!existsSync9(distMcp)) {
+        if (!existsSync10(distMcp)) {
           return { content: [{ type: "text", text: `Plugin is not built: ${distMcp} missing. Run \`npm run build\` in ${pluginRoot} first.` }] };
         }
         const which = spawnSync("bash", ["-lc", "command -v claude"], { encoding: "utf-8" });
         const claudeBin = which.status === 0 ? (which.stdout || "").trim() : "";
-        const durableDataDir = join12(homedir4(), ".claude-report");
+        const durableDataDir = join13(homedir4(), ".claude-report");
         mkdirSync5(durableDataDir, { recursive: true });
-        const durableConfigPath = join12(durableDataDir, "config.json");
+        const durableConfigPath = join13(durableDataDir, "config.json");
         const migratedFrom = [];
-        if (!existsSync9(durableConfigPath)) {
+        if (!existsSync10(durableConfigPath)) {
           const pluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
           if (pluginDataDir) {
-            const src = join12(pluginDataDir, "config.json");
-            if (existsSync9(src)) {
+            const src = join13(pluginDataDir, "config.json");
+            if (existsSync10(src)) {
               try {
                 copyFileSync(src, durableConfigPath);
                 migratedFrom.push(src);
@@ -3491,15 +3531,15 @@ ${formatted}`
             }
           }
         }
-        const logDir = join12(durableDataDir, "logs");
+        const logDir = join13(durableDataDir, "logs");
         mkdirSync5(logDir, { recursive: true });
         const label = "com.claude-report.daily-usage";
-        const plistPath = join12(homedir4(), "Library", "LaunchAgents", `${label}.plist`);
+        const plistPath = join13(homedir4(), "Library", "LaunchAgents", `${label}.plist`);
         mkdirSync5(dirname2(plistPath), { recursive: true });
         let backupPath = null;
-        if (existsSync9(plistPath)) {
+        if (existsSync10(plistPath)) {
           try {
-            const existing = readFileSync9(plistPath, "utf-8");
+            const existing = readFileSync10(plistPath, "utf-8");
             backupPath = `${plistPath}.bak.${Date.now()}`;
             writeFileSync3(backupPath, existing, "utf-8");
           } catch {
@@ -3545,10 +3585,10 @@ ${formatted}`
     </dict>
 
     <key>StandardOutPath</key>
-    <string>${xmlEscape(join12(logDir, "daily-usage-stdout.log"))}</string>
+    <string>${xmlEscape(join13(logDir, "daily-usage-stdout.log"))}</string>
 
     <key>StandardErrorPath</key>
-    <string>${xmlEscape(join12(logDir, "daily-usage-stderr.log"))}</string>
+    <string>${xmlEscape(join13(logDir, "daily-usage-stderr.log"))}</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -3586,6 +3626,133 @@ ${envXml}
         if (backupPath) outLines.push(`- backup:        ${backupPath} (previous plist)`);
         if (migratedFrom.length) outLines.push(`- migrated:      ${migratedFrom.join(", ")} \u2192 ${durableConfigPath}`);
         outLines.push(``, `Next step: run /verify (verify_setup) to confirm both the live Slack post and the scheduled path.`, ``, `Note: if your Mac is asleep at the scheduled time, launchd fires on next wake, not at exactly ${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}.`);
+        return { content: [{ type: "text", text: outLines.join("\n") }] };
+      }
+    );
+    server.tool(
+      "install_codex_watcher",
+      "Install (or refresh) the macOS launchd job that runs the Codex watcher daemon. The watcher tails ~/.codex/sessions/**/rollout-*.jsonl and posts real-time activity-log events (git push/commit/PR/test failure) into the same daily Slack thread as the Claude Code hook. Idempotent \u2014 safe to re-run after a plugin update.",
+      {},
+      async () => {
+        const { spawnSync } = await import("child_process");
+        const { writeFileSync: writeFileSync3, mkdirSync: mkdirSync5, existsSync: existsSync10, readFileSync: readFileSync10 } = await import("fs");
+        const { homedir: homedir4, platform: platform2 } = await import("os");
+        const { join: join13, dirname: dirname2 } = await import("path");
+        if (platform2() !== "darwin") {
+          return {
+            content: [{
+              type: "text",
+              text: "install_codex_watcher currently only supports macOS (launchd). On Linux, run `dist/codex-watcher/index.js` from a systemd service with Restart=always."
+            }]
+          };
+        }
+        const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || process.env.CLAUDE_REPORT_PLUGIN_DIR;
+        if (!pluginRoot) {
+          return {
+            content: [{ type: "text", text: "Cannot resolve plugin root. Call this tool from a Claude Code plugin session so CLAUDE_PLUGIN_ROOT is set." }]
+          };
+        }
+        const wrapperPath = join13(pluginRoot, "bin", "codex-watcher-wrapper.sh");
+        const watcherJs = join13(pluginRoot, "dist", "codex-watcher", "index.js");
+        if (!existsSync10(wrapperPath)) {
+          return { content: [{ type: "text", text: `Wrapper not found at ${wrapperPath}. Reinstall the plugin.` }] };
+        }
+        if (!existsSync10(watcherJs)) {
+          return { content: [{ type: "text", text: `Watcher build missing at ${watcherJs}. Run \`npm run build\` in ${pluginRoot} first.` }] };
+        }
+        const which = spawnSync("bash", ["-lc", "command -v node"], { encoding: "utf-8" });
+        const nodeBin = which.status === 0 ? (which.stdout || "").trim() : "";
+        const durableDataDir = join13(homedir4(), ".claude-report");
+        mkdirSync5(durableDataDir, { recursive: true });
+        const logDir = join13(durableDataDir, "logs");
+        mkdirSync5(logDir, { recursive: true });
+        const label = "com.claude-report.codex-watcher";
+        const plistPath = join13(homedir4(), "Library", "LaunchAgents", `${label}.plist`);
+        mkdirSync5(dirname2(plistPath), { recursive: true });
+        let backupPath = null;
+        if (existsSync10(plistPath)) {
+          try {
+            const existing = readFileSync10(plistPath, "utf-8");
+            backupPath = `${plistPath}.bak.${Date.now()}`;
+            writeFileSync3(backupPath, existing, "utf-8");
+          } catch {
+            backupPath = null;
+          }
+        }
+        const envEntries = [
+          ["PATH", `${nodeBin ? dirname2(nodeBin) + ":" : ""}/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin`],
+          ["HOME", homedir4()],
+          ["CLAUDE_REPORT_PLUGIN_DIR", pluginRoot],
+          ["CLAUDE_REPORT_DATA_DIR", durableDataDir]
+        ];
+        if (nodeBin) envEntries.push(["NODE_BIN", nodeBin]);
+        const xmlEscape = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+        const envXml = envEntries.map(([k, v]) => `        <key>${xmlEscape(k)}</key>
+        <string>${xmlEscape(v)}</string>`).join("\n");
+        const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${xmlEscape(wrapperPath)}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${xmlEscape(pluginRoot)}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>${xmlEscape(join13(logDir, "codex-watcher-stdout.log"))}</string>
+    <key>StandardErrorPath</key>
+    <string>${xmlEscape(join13(logDir, "codex-watcher-stderr.log"))}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+${envXml}
+    </dict>
+</dict>
+</plist>
+`;
+        writeFileSync3(plistPath, plist, "utf-8");
+        const uid = process.getuid ? process.getuid() : null;
+        if (uid === null) {
+          return {
+            content: [{ type: "text", text: `Wrote plist to ${plistPath} but could not determine UID; load manually with \`launchctl bootstrap gui/$(id -u) ${plistPath}\`.` }]
+          };
+        }
+        spawnSync("launchctl", ["bootout", `gui/${uid}`, plistPath], { stdio: "pipe" });
+        const bootstrap = spawnSync("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "pipe", encoding: "utf-8" });
+        if (bootstrap.status !== 0) {
+          const stderr = (bootstrap.stderr || "").trim() || `exit ${bootstrap.status}`;
+          return {
+            content: [{ type: "text", text: `Wrote plist to ${plistPath} but launchctl bootstrap failed: ${stderr}` }]
+          };
+        }
+        const outLines = [
+          `\u2705 Codex watcher daemon scheduled.`,
+          ``,
+          `- plist:        ${plistPath}`,
+          `- wrapper:      ${wrapperPath}`,
+          `- watcher:      ${watcherJs}`,
+          `- node bin:     ${nodeBin || "(resolved from PATH at run time)"}`,
+          `- plugin root:  ${pluginRoot}`,
+          `- data dir:     ${durableDataDir} (pinned via CLAUDE_REPORT_DATA_DIR)`,
+          `- logs:         ${logDir}/codex-watcher-{stdout,stderr}.log`,
+          `- KeepAlive:    on (launchd restarts on crash, throttled to 10s)`
+        ];
+        if (backupPath) outLines.push(`- backup:       ${backupPath} (previous plist)`);
+        outLines.push(
+          ``,
+          `The watcher tails ~/.codex/sessions/**/rollout-*.jsonl on a 2-second tick.`,
+          `On first start it skips historical events to avoid replaying old sessions \u2014`,
+          `only new bytes appended after install will be reported to Slack.`
+        );
         return { content: [{ type: "text", text: outLines.join("\n") }] };
       }
     );
