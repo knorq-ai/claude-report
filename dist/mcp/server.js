@@ -389,7 +389,8 @@ function resolveProjectName(projectDir) {
   return basename(projectDir);
 }
 function todayStr() {
-  return (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+  const d = /* @__PURE__ */ new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 function projectKey(userId, project) {
   const hash = createHash2("sha256").update(`${userId}:${project}`).digest("hex").slice(0, 12);

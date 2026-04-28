@@ -49,8 +49,17 @@ export function resolveProjectName(projectDir: string): string {
   return basename(projectDir);
 }
 
+/**
+ * Today's date in LOCAL time as YYYY-MM-DD. Must match the local-time format
+ * used by activity-thread.ts (`localDateStr`) and usage-stats.ts
+ * (`localDateString`); using UTC here while the hook posts using local-time
+ * caused dailyPostDate to flip-flop during the JST evening (UTC date is the
+ * previous day for a ~9-hour window), wiping threadId on every hook fire and
+ * spawning a fresh Slack parent thread for every event.
+ */
 function todayStr(): string {
-  return new Date().toISOString().slice(0, 10);
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
 /** Stable short hash for a project name — used as filename key */
